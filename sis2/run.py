@@ -333,7 +333,7 @@ def _check_arrays(workdir: Path, res: dict, n_train: int, n_test: int) -> str:
 
 
 def _oof_agrees(oof_path: str, y, metric: str, claimed: float,
-                tol: float = 0.01) -> str:
+                tol: float = 0.01, folds=None) -> str:
     """Does the saved OOF actually reproduce the score the script claimed?
 
     This is the check that catches everything shape-and-finiteness cannot.
@@ -361,6 +361,21 @@ def _oof_agrees(oof_path: str, y, metric: str, claimed: float,
         return "scoring the saved oof produced a non-finite value"
     # Generous tolerance: fold-averaged and pooled scores differ slightly even
     # when everything is correct. A real corruption is off by orders more.
+    if abs(actual - claimed) > tol and folds is not None and len(folds) == len(y):
+        # Distinguish "wrong array" from "right array, per-fold scales differ".
+        # A ranking objective (pairwise AUC surrogate) emits raw scores whose
+        # scale changes fold to fold: every fold's AUC is right, the pooled
+        # AUC is not (bankA exp11: fold mean 0.948, pooled 0.798). Telling the
+        # debugger "this is not the array you scored" sends it after a
+        # misalignment that does not exist.
+        per = float(_np.mean(_m.fold_scores(y, oof, folds, metric)))
+        if abs(per - claimed) <= tol:
+            return (f"each fold's OOF reproduces its score (mean {per:.5f}) but the "
+                    f"POOLED OOF scores {actual:.5f}: predictions are on a different "
+                    f"scale in each fold. Map every fold's raw scores onto one "
+                    f"common scale before saving — e.g. a sigmoid/Platt fit on that "
+                    f"fold's training rows, or probabilities from predict_proba — "
+                    f"so the saved OOF (and test mean) can be blended and analysed.")
     if abs(actual - claimed) > tol:
         zeros = float((oof == 0).mean())
         extra = (f" {zeros:.0%} of the array is exactly 0 — folds were probably "
@@ -489,7 +504,14 @@ def run_local(code: str, workdir: Path, *, frac: float = 1.0,
             # legitimately differ by a few points; a misaligned array is off
             # by far more (a good model rescoring near chance).
             tol = 0.01 if frac >= 1.0 else max(0.05, 0.1 * abs(cv))
-            bad = _oof_agrees(res["oof_path"], y_ref, metric, cv, tol)
+            folds = None
+            fp = Path(data_dir) / "folds.npy"
+            if fp.exists():
+                import numpy as _np2
+                f_all = _np2.load(fp)
+                if len(f_all) == n_train:
+                    folds = f_all if frac >= 1.0 else (f_all[idx] if idx is not None else None)
+            bad = _oof_agrees(res["oof_path"], y_ref, metric, cv, tol, folds)
             if bad:
                 return {"failure": "bug", "runtime_s": runtime,
                         "error": bad + ("" if frac >= 1.0 else
