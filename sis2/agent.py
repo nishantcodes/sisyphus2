@@ -370,6 +370,9 @@ Our best public LB score so far: {f'{lb:.5f}' if lb is not None else 'nothing su
 # Where prediction-space is already crowded (measured, not labelled)
 {self._novelty()}
 
+# The portfolio — what we would submit right now
+{self._portfolio()}
+
 # Running right now — do NOT duplicate these
 {flight_txt}
 
@@ -771,6 +774,25 @@ variant that ties, because it adds information the ledger does not have.
             out.append(f"exp #{minid} is the most decorrelated at {mind:.3f} — that "
                        f"direction has room in it.")
         return "\n".join(out)
+
+    def _portfolio(self) -> str:
+        """The current best blend and who is in it.
+
+        The board is won by the ensemble, not by the best single model, and a
+        rival judged only on single-model CV has no reason to build the
+        decorrelated model the ensemble actually needs. Showing the blend and
+        its weights makes "enters the portfolio" a visible way to win a turn.
+        """
+        b = store.champion(self.conn, "blend")
+        single = store.champion(self.conn)
+        if b is None or single is None:
+            return ("(no blend beats the best single model yet — a model that is "
+                    "differently wrong is what would create one)")
+        return (f"blend exp #{b['id']}: nested-CV {b['cv']:.6f} +/- {b['cv_std']:.6f} "
+                f"vs best single #{single['id']} {single['cv']:.6f}\n"
+                f"members (weight): {b['hypothesis'].split('weights', 1)[-1].strip()}\n"
+                f"A model that earns weight here is a win even if it loses to the "
+                f"champion on its own.")
 
     def pick_family(self) -> str:
         """Which family to work on this turn.

@@ -96,7 +96,10 @@ def make_folds(data_dir: Path, n_folds: int = 10, seed: int = 42,
     train = pd.read_csv(data_dir / "train.csv")
     y = train[target] if target and target in train.columns else None
     idx = np.arange(len(train))
-    if y is not None and y.nunique() <= 50:
+    # Labels are stratified; a numeric target with many values (a regression,
+    # or a count like abalone's Rings) is not — StratifiedKFold would treat
+    # every distinct value as a class and trip over values seen once.
+    if y is not None and (y.nunique() <= 2 or not pd.api.types.is_numeric_dtype(y)):
         from sklearn.model_selection import StratifiedKFold
         splitter = StratifiedKFold(n_folds, shuffle=True, random_state=seed)
         parts = splitter.split(idx, y)

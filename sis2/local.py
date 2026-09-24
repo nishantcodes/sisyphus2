@@ -112,9 +112,15 @@ def prepare(home: Path, source: str, *, target: str = "", test_frac: float = 0.3
             df[c] = df[c].astype(str).str.strip().replace({"?": np.nan})
     df.insert(0, "id", np.arange(len(df)))
 
-    strat = df[target] if df[target].nunique() <= 50 else None
-    tr, te = train_test_split(df, test_size=test_frac, random_state=seed,
-                              stratify=strat)
+    # Stratify labels, not numbers: a count target like abalone's Rings has
+    # values seen once, which train_test_split refuses to stratify.
+    numeric = pd.api.types.is_numeric_dtype(df[target]) and df[target].nunique() > 2
+    strat = None if numeric else df[target]
+    try:
+        tr, te = train_test_split(df, test_size=test_frac, random_state=seed,
+                                  stratify=strat)
+    except ValueError:                  # a label with a single row
+        tr, te = train_test_split(df, test_size=test_frac, random_state=seed)
     tr, te = tr.reset_index(drop=True), te.reset_index(drop=True)
     tr["id"] = np.arange(len(tr))
     te["id"] = np.arange(len(tr), len(tr) + len(te))
