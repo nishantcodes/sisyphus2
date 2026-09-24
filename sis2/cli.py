@@ -425,6 +425,27 @@ def cmd_finals(a) -> None:
           f"/submissions (browser only — Kaggle has no API for this).")
 
 
+def cmd_research(a) -> None:
+    """Study public notebooks into discovery notes (ideas, never OOFs)."""
+    from . import llm, research
+    home = _home(a.slug)
+    files = []
+    if a.source:
+        src = Path(a.source)
+        files = sorted(src.rglob("*.ipynb")) + sorted(src.rglob("*.py")) \
+            if src.is_dir() else [src]
+    else:
+        files = research.pull_top(a.slug, home / "research", top=a.top)
+        if not files:
+            sys.exit("could not list notebooks from Kaggle (no access?) — pass "
+                     "--source DIR to study local notebooks instead")
+    written = research.study(llm.LLM(home, prefer=os.getenv("SIS_BACKEND", "cli")),
+                             ROOT / "notes" / a.slug, files, a.slug)
+    print(f"{len(written)} new note(s) from {len(files)} notebook(s)")
+    for w in written:
+        print(f"  {w}")
+
+
 def cmd_hint(a) -> None:
     """Steer the campaign from the terminal.
 
@@ -460,7 +481,7 @@ def cmd_check(a) -> None:
     """Run every module's self-check. One command to prove the install works."""
     import subprocess
     mods = ["metrics", "run", "store", "analyst", "kaggle", "llm", "agent",
-            "blend", "notify", "local", "recipes"]
+            "blend", "notify", "local", "recipes", "research"]
     bad = 0
     for m in mods:
         r = subprocess.run([sys.executable, "-m", f"sis2.{m}"],
@@ -534,6 +555,12 @@ def main() -> None:
     f.add_argument("--poll", type=int, default=45)
     f.add_argument("--timeout", type=int, default=5400)
     f.set_defaults(fn=cmd_fanout)
+
+    rs = sub.add_parser("research", help="study public notebooks into notes")
+    rs.add_argument("slug")
+    rs.add_argument("--source", default="", help="local notebook file or directory")
+    rs.add_argument("--top", type=int, default=5, help="top-voted notebooks to pull")
+    rs.set_defaults(fn=cmd_research)
 
     c = sub.add_parser("check", help="run every self-check")
     c.set_defaults(fn=cmd_check)

@@ -43,6 +43,9 @@ SEATS: dict[str, tuple[str, str]] = {
     "reporter": (os.getenv("SIS_REPORTER", "claude-haiku-4-5"), "low"),
     # Writes the script from the thinker's spec when SIS_SPLIT=1.
     "executor": (os.getenv("SIS_EXECUTOR", "sonnet"), "medium"),
+    # Reads public notebooks and writes discovery notes (research.py). A
+    # reading-comprehension job, not a judgement one — mid-tier is enough.
+    "researcher": (os.getenv("SIS_RESEARCHER", "claude-sonnet-5"), "medium"),
 }
 
 # An optional third rival, off unless SIS_RIVAL_C names a model. Measured on

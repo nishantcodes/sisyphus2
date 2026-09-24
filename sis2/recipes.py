@@ -24,7 +24,10 @@ SEED = 42
 tr = pd.read_csv(os.path.join(DATA, "train.csv"))
 te = pd.read_csv(os.path.join(DATA, "test.csv"))
 folds = np.load(os.path.join(DATA, "folds.npy"))
-if FRAC < 1:
+if os.environ.get("SIS_IDX"):                          # harness-chosen smoke rows
+    idx = np.load(os.environ["SIS_IDX"])
+    tr, folds = tr.iloc[idx].reset_index(drop=True), folds[idx]
+elif FRAC < 1:
     idx = np.random.default_rng(SEED).choice(len(tr), max(200, int(len(tr) * FRAC)), replace=False)
     tr, folds = tr.iloc[idx].reset_index(drop=True), folds[idx]
 t = tr[TARGET]

@@ -142,8 +142,15 @@ The script you write must:
    **`folds` has one entry per FULL training row.** If you subsample for
    ${FRAC_ENV}, you must subsample `folds` with the SAME indices, or the
    boolean mask will be 668k long against a 33k frame and every fold raises
-   `IndexError: Boolean index has wrong length`. Do it in one step:
-       idx = rng.choice(len(train), int(len(train) * frac), replace=False)
+   `IndexError: Boolean index has wrong length`. **When ${IDX_ENV} is set, the
+   harness has chosen the rows — use exactly those, in that order** (the saved
+   OOF is checked against their labels). Do it in one step:
+       if os.environ.get("{IDX_ENV}"):
+           idx = np.load(os.environ["{IDX_ENV}"])
+       elif frac < 1:
+           idx = rng.choice(len(train), int(len(train) * frac), replace=False)
+       else:
+           idx = np.arange(len(train))
        train, folds = train.iloc[idx].reset_index(drop=True), folds[idx]
    Keep `oof` the same length as the (possibly subsampled) train frame.
    **Iterate over EVERY fold — `for k in np.unique(folds)`.** Never hardcode a
@@ -325,7 +332,8 @@ def _check_arrays(workdir: Path, res: dict, n_train: int, n_test: int) -> str:
     return ""
 
 
-def _oof_agrees(oof_path: str, y, metric: str, claimed: float) -> str:
+def _oof_agrees(oof_path: str, y, metric: str, claimed: float,
+                tol: float = 0.01) -> str:
     """Does the saved OOF actually reproduce the score the script claimed?
 
     This is the check that catches everything shape-and-finiteness cannot.
@@ -353,7 +361,7 @@ def _oof_agrees(oof_path: str, y, metric: str, claimed: float) -> str:
         return "scoring the saved oof produced a non-finite value"
     # Generous tolerance: fold-averaged and pooled scores differ slightly even
     # when everything is correct. A real corruption is off by orders more.
-    if abs(actual - claimed) > 0.01:
+    if abs(actual - claimed) > tol:
         zeros = float((oof == 0).mean())
         extra = (f" {zeros:.0%} of the array is exactly 0 — folds were probably "
                  f"skipped; iterate over np.unique(folds), never a hardcoded count."
@@ -477,11 +485,20 @@ def run_local(code: str, workdir: Path, *, frac: float = 1.0,
     if y is not None:
         y_ref = y if frac >= 1.0 else (y[idx] if idx is not None else None)
         if y_ref is not None:
-            bad = _oof_agrees(res["oof_path"], y_ref, metric, cv)
+            # On a small smoke sample the fold-mean and pooled scores can
+            # legitimately differ by a few points; a misaligned array is off
+            # by far more (a good model rescoring near chance).
+            tol = 0.01 if frac >= 1.0 else max(0.05, 0.1 * abs(cv))
+            bad = _oof_agrees(res["oof_path"], y_ref, metric, cv, tol)
             if bad:
                 return {"failure": "bug", "runtime_s": runtime,
                         "error": bad + ("" if frac >= 1.0 else
-                                        "  (caught at SMOKE — fix this before the full run)")}
+                                        f"  (caught at SMOKE — fix this before the "
+                                        f"full run. Smoke runs MUST subsample to "
+                                        f"exactly the rows in ${IDX_ENV}: "
+                                        f"idx = np.load(os.environ['{IDX_ENV}']). "
+                                        f"The check compares your OOF against the "
+                                        f"labels of THOSE rows, in that order.)")}
     return res
 
 

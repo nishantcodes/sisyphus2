@@ -398,9 +398,16 @@ Now propose one change, in the required format."""
             # 10 folds legitimately needs longer than a GBDT, and a flat 900s
             # budget killed the only transformer this campaign has produced.
             heavy = bool(re.search(r"^\s*(import|from)\s+torch", code, re.M))
+            # Labels and row counts go to the smoke run too, so the harness
+            # picks the subsample ($SIS_IDX) and checks the saved OOF against
+            # y[idx]. Without them a misaligned OOF (exp7 on bankB: printed
+            # 0.943, array scored 0.502) sailed through smoke and was only
+            # caught after the full run had been paid for.
             res = run.run_local(code, wd,
                                 frac=SMOKE_FRAC / 5 if heavy else SMOKE_FRAC,
-                                data_dir=self.data, timeout=2400 if heavy else 900)
+                                data_dir=self.data, timeout=2400 if heavy else 900,
+                                n_train=n_tr, n_test=n_te, y=self._y(),
+                                metric=self.metric)
             # A machine under pressure is not a broken script. Sending this to
             # the debugger would burn three repair rounds "fixing" correct code
             # and then record a bug that never existed — the same way the
@@ -447,6 +454,18 @@ Now propose one change, in the required format."""
         res = run.run_local(code, wd, frac=1.0, data_dir=self.data,
                             n_train=n_tr, n_test=n_te,
                             y=self._y(), metric=self.metric)
+        # A full run that fails as a BUG (not a timeout or OOM) gets one repair
+        # and one rerun. The hypothesis already survived smoke; losing it to a
+        # defect only visible at full scale throws away the proposal.
+        if res.get("failure") == "bug":
+            fixed = self._repair(code, res)
+            if fixed:
+                self.conn.execute("UPDATE experiments SET code=? WHERE id=?",
+                                  (fixed, exp_id))
+                self.conn.commit()
+                res = run.run_local(fixed, wd, frac=1.0, data_dir=self.data,
+                                    n_train=n_tr, n_test=n_te,
+                                    y=self._y(), metric=self.metric)
 
         # An OOM is a statement about THIS LAPTOP, not about the idea. Three
         # novel formulations (spline GLMs, a tensor-product GLM, a transformer)

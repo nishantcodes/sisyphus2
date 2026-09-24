@@ -20,12 +20,14 @@ when configured.
 ## The loop
 
 ```
-champion  = best scored experiment in this family
+seed      = recipes (LGBM / XGB / CatBoost), no LLM      <- turn 0
+champion  = best scored single model
 brief     = analyst.report(champion)     <- WHERE it is losing, measured
-proposal  = rival.propose(brief, notes, history)
-result    = run(proposal)                <- smoke at 5%, then full
-verdict   = compare to parent, fold spread as the noise floor
-if better: write a discovery note, consider submitting
+proposal  = rival.propose(brief, notes, history, portfolio)   (written while
+result    = run(proposal)                <- smoke at 5%, then full   the previous
+verdict   = paired fold-by-fold test vs parent                      run trains)
+portfolio = nested-CV blend of everything; best candidate may be submitted
+if better: write a discovery note
 ```
 
 v1 searched configurations by UCT and landed on `CV 0.970177 / LB 0.97125` in
@@ -50,11 +52,33 @@ family. That report is the input to every proposal.
 | `blend.py` | greedy hill-climb ensemble over *our own* OOF pool |
 | `kaggle.py` | data, shared folds, six submission validations, GPU kernels |
 | `llm.py` | subscription (`claude -p`) first, API on throttle, usage ledger |
-| `metrics.py` | the only file that knows what the metric means |
+| `metrics.py` | the only file that knows what the metric means; paired fold test |
 | `notify.py` | Telegram out; replies become one-shot hint rows |
-| `cli.py` | commands, and the auto-submit rule |
+| `cli.py` | commands, the pipelined run loop, and the auto-submit rule |
+| `local.py` | offline Kaggle: hidden labels, public/private board (`init --local`) |
+| `recipes.py` | LLM-free LGBM/XGB/CatBoost baselines that seed every campaign |
 
-`sis2 check` runs every module's self-check (59 assertions, no framework).
+`sis2 check` runs every module's self-check (no framework).
+
+Binary, regression and **multiclass** targets are supported: a multiclass
+script saves `(n, k)` probability matrices (sorted-label columns) and the
+harness scores accuracy / MAP@k / log loss from them.
+
+See **ARCHITECTURE.md** for how the seats communicate and why.
+
+## No Kaggle access? Run a local competition
+
+```
+sis2 init bank --local bank            # UCI bank marketing (s5e8's source), AUC
+sis2 init abalone --local abalone      # regression, RMSLE (s4e4's source)
+sis2 init wine --local wine            # multiclass, MAP@3
+sis2 init mycomp --local path/or/url.csv --target label --metric auc
+sis2 run bank --turns 12
+sis2 private bank                      # the hidden private scores, operator only
+```
+
+The test labels live in `work/<slug>/.lb/`, outside the `$SIS_DATA` directory
+scripts can read; only the public score enters the ledger (and so the prompts).
 
 ## Design rules worth not breaking
 
@@ -67,8 +91,11 @@ and a submission, so every finished experiment was a dead end.
 init. v1 let each script build its own split, which made a 0.001 difference
 indistinguishable from split noise — and 0.001 decides a playground competition.
 
-**Three verdicts, not two.** A gain inside the fold spread is `inconclusive`.
-This is the rule that stops the agent building a strategy on a fluke.
+**Three verdicts, not two.** A gain that is not consistent fold by fold is
+`inconclusive`. This is the rule that stops the agent building a strategy on a
+fluke. The test is *paired* on the shared folds (mean delta vs its standard
+error, plus a minimum effect of 5% of the fold spread) — comparing against the
+raw fold spread, as v2.0 did, called a +0.0016 gain with t=6.3 "noise".
 
 **A crash is not a refutation.** Failures are classified `bug` / `timeout` /
 `oom` and never produce a `worse` verdict. A KeyError says nothing about whether
@@ -161,8 +188,9 @@ rivalry between two instances of one model is just a more expensive single agent
 
 ## Auto-submit
 
-Sends when a new champion beats the best already-submitted CV **by more than the
-fold spread**, and slots remain today. Unused Kaggle slots expire, and over a
+Sends when the best candidate — a single model **or the portfolio blend** —
+beats the best already-submitted experiment **under the paired test**, and
+slots remain today. Unused Kaggle slots expire, and over a
 month that is up to 140 discarded reads on the test distribution; the noise-floor
 clause is what stops it spending them on runs it cannot tell apart.
 
