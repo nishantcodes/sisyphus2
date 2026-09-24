@@ -1,0 +1,17 @@
+[project]
+name = "sis2"
+version = "0.2.0"
+requires-python = ">=3.11"
+dependencies = [
+  "anthropic>=0.69",
+  "kaggle>=1.7",
+  "pandas", "numpy", "scikit-learn", "scipy",
+  "lightgbm", "xgboost", "catboost",
+  "httpx", "python-dotenv",
+]
+
+[project.scripts]
+sis2 = "sis2.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["sis2*"]
