@@ -52,7 +52,7 @@ def _campaign(slug: str):
         sys.exit(f"no campaign at {home}. Run `sis2 init {slug} --target <col>` first.")
     prefer = os.getenv("SIS_BACKEND", "cli")
     return agent.Campaign(home, llm.LLM(home, prefer=prefer), slug=slug,
-                          notes_dir=ROOT / "notes")
+                          notes_dir=ROOT / "notes" / slug)
 
 
 # ------------------------------------------------------------------ commands
@@ -96,7 +96,9 @@ def cmd_init(a) -> None:
 
 
 def cmd_run(a) -> None:
-    from . import blend, kaggle, notify, store
+    from concurrent.futures import ThreadPoolExecutor
+
+    from . import blend, notify, store
     from . import llm as llm_mod
     camp = _campaign(a.slug)
     seats = llm_mod.rivals()   # rival_c joins automatically when configured
@@ -104,6 +106,47 @@ def cmd_run(a) -> None:
     if notify.enabled() and not a.quiet:
         notify.send(f"sis2 campaign starting on {a.slug} — {a.turns} turns")
 
+    # A run killed mid-experiment leaves a row 'running' forever, and it then
+    # sits in every prompt's "running right now — do not duplicate" list.
+    camp.conn.execute("UPDATE experiments SET status='queued' WHERE status='running'")
+    camp.conn.commit()
+
+    def after(line: str) -> None:
+        print(f"{time.strftime('%H:%M:%S')} {line}", flush=True)
+        try:
+            pl = blend.refresh_portfolio(camp.conn, camp.home, camp.data)
+            if pl:
+                print(f"  {pl}", flush=True)
+        except Exception as e:           # the portfolio must never stop a campaign
+            print(f"  portfolio failed: {str(e)[:120]}", flush=True)
+        if a.submit:
+            sent, why = maybe_submit(camp, a.slug)
+            if sent:
+                print(f"  -> {why}", flush=True)
+                if notify.enabled():
+                    notify.send(f"submitted on {a.slug}\n{why}")
+
+    if a.seed and not camp.conn.execute(
+            "SELECT 1 FROM experiments WHERE source='recipe'").fetchone():
+        for line in camp.seed():
+            after(line)
+
+    # Anything left queued by an earlier run goes first.
+    while (row := store.next_queued(camp.conn)) is not None:
+        after(camp.run_one(row["id"]))
+
+    def propose(seat: str, i: int):
+        c = camp.clone()                 # SQLite connections are per-thread
+        try:
+            return c.propose_and_queue(seat, i)
+        finally:
+            c.conn.close()
+
+    # Pipelined: proposal i+1 is written while experiment i trains. It sees
+    # experiment i in its "running right now" list rather than its result —
+    # a one-turn lag bought for roughly halving wall clock per turn.
+    pool = ThreadPoolExecutor(max_workers=1)
+    ahead = None
     for i in range(a.turns):
         if a.hours and (time.time() - started) / 3600 >= a.hours:
             print(f"[wall clock] {a.hours}h budget reached")
@@ -112,26 +155,27 @@ def cmd_run(a) -> None:
         # lands on this turn rather than the next one.
         for h in notify.poll_hints(camp.conn, camp.home):
             print(f"[hint] {h}")
-
         seat = seats[i % len(seats)]        # the rivalry: alternate the proposer
-        line = camp.turn(seat, turn_no=i)
-        print(f"{time.strftime('%H:%M:%S')} {line}", flush=True)
-        try:
-            pl = blend.refresh_portfolio(camp.conn, camp.home, camp.data)
-            if pl:
-                print(f"  {pl}", flush=True)
-        except Exception as e:           # the portfolio must never stop a campaign
-            print(f"  portfolio failed: {str(e)[:120]}", flush=True)
-
-        if a.submit:
-            sent, why = maybe_submit(camp, a.slug)
-            if sent:
-                print(f"  -> {why}", flush=True)
-                if notify.enabled():
-                    notify.send(f"submitted on {a.slug}\n{why}")
+        if not a.pipeline:
+            after(camp.turn(seat, turn_no=i))
+            continue
+        if ahead is None:
+            ahead = pool.submit(propose, seat, i)
+        eid, msg = ahead.result()
+        nxt = i + 1
+        ahead = (pool.submit(propose, seats[nxt % len(seats)], nxt)
+                 if nxt < a.turns else None)
+        if eid is None:
+            print(f"{time.strftime('%H:%M:%S')} {msg}", flush=True)
+            continue
+        after(camp.run_one(eid, seat))
+    if ahead is not None:                   # budget hit with a proposal in hand
+        eid, _ = ahead.result()
+        print(f"(exp #{eid} left queued for the next run)" if eid else "")
+    pool.shutdown()
 
     if a.blend:
-        ok, msg = blend.build(camp.conn, camp.home, camp.data)
+        ok, msg = blend.build(camp.conn, camp.home, camp.data, record=False)
         print("\n" + msg)
 
     summary = notify.campaign_summary(camp.conn, camp.llm)
@@ -452,7 +496,11 @@ def main() -> None:
     r.add_argument("--blend", action="store_true",
                    help="also build an ensemble at the end (off by default)")
     r.add_argument("--quiet", action="store_true", help="no Telegram start/end message")
-    r.set_defaults(fn=cmd_run, submit=True, blend=False)
+    r.add_argument("--no-pipeline", dest="pipeline", action="store_false",
+                   help="propose and execute strictly in series")
+    r.add_argument("--no-seed", dest="seed", action="store_false",
+                   help="skip the recipe baselines on a fresh campaign")
+    r.set_defaults(fn=cmd_run, submit=True, blend=False, pipeline=True, seed=True)
 
     for name, fn, helptext in (("status", cmd_status, "where the campaign is"),
                                ("blend", cmd_blend, "build the ensemble"),

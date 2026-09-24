@@ -201,6 +201,9 @@ class Campaign:
         self.data = self.home / "input"
         self.metric = store.meta(self.conn, "metric", "auc")
         self.target = store.meta(self.conn, "target", "")
+        # Recipes (and any script that wants them) read these rather than
+        # hardcoding a column name.
+        os.environ["SIS_TARGET"], os.environ["SIS_METRIC"] = self.target, self.metric
 
     # ------------------------------------------------------------- context
 
@@ -356,6 +359,9 @@ Our best public LB score so far: {f'{lb:.5f}' if lb is not None else 'nothing su
 
 # Discovery notes from this and previous campaigns
 {store.read_notes(self.notes_dir)}
+
+# Transferable lessons from OTHER competitions (weigh them; data differs)
+{store.read_notes(self.notes_dir.parent / "_global", limit=30)}
 
 # Everything tried, most recent first
 {self._history("")}
@@ -779,56 +785,92 @@ variant that ties, because it adds information the ledger does not have.
             counts[r["family"]] = r["n"]
         return min(counts, key=lambda f: counts[f])
 
-    def turn(self, seat: str = "rival_a", turn_no: int = 0) -> str:
-        """One full cycle. Returns a one-line summary for the log."""
-        # A queued row (a user hint, or a retry) always goes first.
-        pending = store.next_queued(self.conn)
-        if pending is not None:
-            exp_id, family = pending["id"], pending["family"]
-            code = pending["code"]
-            brief = ""
-        else:
-            family = self.pick_family()
-            brief = self._brief(family)
-            hint = store.pending_hint(self.conn)
-            advice = self._advice(family, turn_no)
-            try:
-                prop = self.propose(seat, family,
-                                    hint["text"] if hint else "", advice, turn_no)
-            except Exception as e:
-                return f"[{seat}] could not get a proposal: {e}"
-            if prop is None:
-                return f"[{seat}] proposal did not parse; skipping this turn"
-            # A hallucinated parent would compute the verdict against the wrong
-            # baseline and corrupt every later attribution — fall back to the
-            # family champion instead of trusting the id.
-            pid = prop["parent_id"]
-            if pid is not None and not self.conn.execute(
-                    "SELECT 1 FROM experiments WHERE id=?", (pid,)).fetchone():
-                champ = store.champion(self.conn, prop["family"])
-                pid = champ["id"] if champ is not None else None
-            exp_id = store.queue(self.conn, family=prop["family"],
-                                 hypothesis=prop["hypothesis"], change=prop["change"],
-                                 code=prop["code"], parent_id=pid, author=seat,
-                                 source="user" if hint else "agent")
-            if hint:
-                store.consume_hint(self.conn, hint["id"], exp_id)
-            family, code = prop["family"], prop["code"]
+    def propose_and_queue(self, seat: str, turn_no: int = 0) -> tuple[int | None, str]:
+        """Ask one rival for a proposal and queue it. (exp_id, message).
 
+        Split from execution so the next proposal can be written WHILE the
+        current experiment trains. A rival call takes 30-150s and a full run
+        on a mid-sized table about as long; doing them in series leaves the
+        CPU idle for half of every turn.
+        """
+        family = self.pick_family()
+        hint = store.pending_hint(self.conn)
+        advice = self._advice(family, turn_no)
+        try:
+            prop = self.propose(seat, family, hint["text"] if hint else "", advice,
+                                turn_no)
+        except Exception as e:
+            return None, f"[{seat}] could not get a proposal: {e}"
+        if prop is None:
+            return None, f"[{seat}] proposal did not parse; skipping this turn"
+        # A hallucinated parent would compute the verdict against the wrong
+        # baseline and corrupt every later attribution — fall back to the
+        # family champion instead of trusting the id.
+        pid = prop["parent_id"]
+        if pid is not None and not self.conn.execute(
+                "SELECT 1 FROM experiments WHERE id=?", (pid,)).fetchone():
+            champ = store.champion(self.conn, prop["family"])
+            pid = champ["id"] if champ is not None else None
+        exp_id = store.queue(self.conn, family=prop["family"],
+                             hypothesis=prop["hypothesis"], change=prop["change"],
+                             code=prop["code"], parent_id=pid, author=seat,
+                             source="user" if hint else "agent")
+        if hint:
+            store.consume_hint(self.conn, hint["id"], exp_id)
+        return exp_id, ""
+
+    def run_one(self, exp_id: int, seat: str = "") -> str:
+        """Execute a queued experiment, record its verdict, maybe write a note."""
+        row = self.conn.execute("SELECT * FROM experiments WHERE id=?",
+                                (exp_id,)).fetchone()
+        family, code = row["family"], row["code"]
+        seat = seat or row["author"] or "?"
         store.mark_running(self.conn, exp_id)
         res = self._execute(exp_id, code)
         verdict = store.finish(self.conn, exp_id, res, judge=self._judge)
         if res.get("failure"):
             return (f"[{seat}] exp #{exp_id} [{family}] FAILED ({res['failure']}): "
                     f"{res.get('error', '')[:160]}")
-
         exp = dict(self.conn.execute("SELECT * FROM experiments WHERE id=?",
                                      (exp_id,)).fetchone())
-        line = (f"[{seat}] exp #{exp_id} [{family}] {verdict} — CV {exp['cv']:.5f} "
+        vs = (f" ({exp['delta']:+.5f}, t {exp['delta_t']:+.1f})"
+              if exp.get("delta") is not None else "")
+        line = (f"[{seat}] exp #{exp_id} [{family}] {verdict}{vs} — CV {exp['cv']:.5f} "
                 f"+/- {exp['cv_std']:.5f} — {exp['change']}")
-        if verdict in ("better", "baseline"):
-            self._write_note(exp, verdict, brief or self._brief(family))
+        if verdict in ("better", "baseline") and exp.get("source") != "recipe":
+            self._write_note(exp, verdict, self._brief(family))
         return line
+
+    def turn(self, seat: str = "rival_a", turn_no: int = 0) -> str:
+        """One full cycle, in series. Returns a one-line summary for the log."""
+        # A queued row (a user hint, or a retry) always goes first.
+        pending = store.next_queued(self.conn)
+        if pending is not None:
+            return self.run_one(pending["id"], seat)
+        exp_id, msg = self.propose_and_queue(seat, turn_no)
+        if exp_id is None:
+            return msg
+        return self.run_one(exp_id, seat)
+
+    def clone(self) -> "Campaign":
+        """Same campaign, own SQLite connection — for use from another thread."""
+        return Campaign(self.home, self.llm, slug=self.slug, notes_dir=self.notes_dir)
+
+    def seed(self) -> list[str]:
+        """Queue and run the recipe baselines that are not in the ledger yet."""
+        from . import recipes
+        have = {r["change"] for r in self.conn.execute(
+            "SELECT change FROM experiments WHERE source='recipe'")}
+        out = []
+        for name in recipes.names():
+            change = recipes.DESCRIPTIONS[name]
+            if change in have:
+                continue
+            eid = store.queue(self.conn, family=name, hypothesis="standard baseline",
+                              change=change, code=recipes.script(name),
+                              source="recipe", author="(recipe)")
+            out.append(self.run_one(eid, "recipe"))
+        return out
 
 
 def demo() -> None:
