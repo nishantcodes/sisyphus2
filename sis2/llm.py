@@ -46,6 +46,9 @@ SEATS: dict[str, tuple[str, str]] = {
     # Reads public notebooks and writes discovery notes (research.py). A
     # reading-comprehension job, not a judgement one — mid-tier is enough.
     "researcher": (os.getenv("SIS_RESEARCHER", "claude-sonnet-5"), "medium"),
+    # Ports a winning change onto the other model families (agent.queue_ports).
+    # Transcription with a clear spec — the rival already did the judgement.
+    "porter": (os.getenv("SIS_PORTER", "claude-sonnet-5"), "medium"),
 }
 
 # An optional third rival, off unless SIS_RIVAL_C names a model. Measured on

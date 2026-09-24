@@ -20,6 +20,7 @@ API for that, and saying otherwise would be wrong.
 from __future__ import annotations
 
 import argparse
+import re
 import os
 import sys
 import time
@@ -162,7 +163,11 @@ def cmd_run(a) -> None:
             print(f"[hint] {h}")
         seat = seats[i % len(seats)]        # the rivalry: alternate the proposer
         if not a.pipeline:
-            after(camp.turn(seat, turn_no=i))
+            line = camp.turn(seat, turn_no=i)
+            after(line)
+            m = re.search(r"exp #(\d+)", line)
+            for pid in (camp.queue_ports(int(m.group(1))) if m else []):
+                after(camp.run_one(pid, "porter"))
             continue
         if ahead is None:
             ahead = pool.submit(propose, seat, i)
@@ -174,6 +179,10 @@ def cmd_run(a) -> None:
             print(f"{time.strftime('%H:%M:%S')} {msg}", flush=True)
             continue
         after(camp.run_one(eid, seat))
+        # A win is carried onto the other model families at once, while the
+        # next rival proposal is still being written.
+        for pid in camp.queue_ports(eid):
+            after(camp.run_one(pid, "porter"))
     if ahead is not None:                   # budget hit with a proposal in hand
         eid, _ = ahead.result()
         print(f"(exp #{eid} left queued for the next run)" if eid else "")

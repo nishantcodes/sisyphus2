@@ -887,7 +887,7 @@ variant that ties, because it adds information the ledger does not have.
               if exp.get("delta") is not None else "")
         line = (f"[{seat}] exp #{exp_id} [{family}] {verdict}{vs} — CV {exp['cv']:.5f} "
                 f"+/- {exp['cv_std']:.5f} — {exp['change']}")
-        if verdict in ("better", "baseline") and exp.get("source") != "recipe":
+        if verdict in ("better", "baseline") and exp.get("source") not in ("recipe", "port"):
             self._write_note(exp, verdict, self._brief(family))
         return line
 
@@ -901,6 +901,73 @@ variant that ties, because it adds information the ledger does not have.
         if exp_id is None:
             return msg
         return self.run_one(exp_id, seat)
+
+    PORT_FAMILIES = ("lgbm", "xgb", "catboost")
+
+    def queue_ports(self, exp_id: int) -> list[int]:
+        """After a win, queue the same change on the other GBDT families.
+
+        Measured on the bank A/B: of campaign B's three `better` verdicts, two
+        were a rival spending a whole frontier-model turn copying experiment
+        5's features onto CatBoost and then XGBoost. That is valuable — each
+        port earned weight in the blend — but it is transcription. The porter
+        (a mid-tier seat) does it from the two scripts, and each port is judged
+        against THAT family's own champion, so the verdict still means "this
+        change helps this model".
+        """
+        if os.getenv("SIS_PORT", "1") == "0":
+            return []
+        exp = self.conn.execute("SELECT * FROM experiments WHERE id=?",
+                                (exp_id,)).fetchone()
+        # Ports of ports would cascade; recipes and blends are not changes.
+        if (exp is None or exp["verdict"] != "better"
+                or exp["source"] in ("recipe", "port", "operator")):
+            return []
+        parent = self.conn.execute("SELECT code FROM experiments WHERE id=?",
+                                   (exp["parent_id"],)).fetchone()
+        queued = []
+        for fam in self.PORT_FAMILIES:
+            if exp["family"].startswith(fam):
+                continue
+            target = store.champion(self.conn, fam)
+            if target is None:
+                continue
+            prompt = f"""A change just beat its parent (paired gain {exp['delta']:+.5f}, t {exp['delta_t']:+.1f}):
+  "{exp['change']}"
+Port exactly that change onto the TARGET script below, which uses a different
+model family ({fam}). Keep the TARGET's model, parameters and structure; add
+only the features / preprocessing that the WINNER adds relative to its PARENT.
+Keep every contract line (shared folds, SIS_FRAC/SIS_IDX, OOF, PRED, CV lines).
+Reply with ONLY the complete script in one ```python block.
+
+# PARENT (what the change was made against)
+```python
+{(parent['code'] if parent else '(none)')[:12000]}
+```
+
+# WINNER
+```python
+{exp['code'][:16000]}
+```
+
+# TARGET ({fam}, exp #{target['id']}, CV {target['cv']:.5f})
+```python
+{target['code'][:12000]}
+```"""
+            try:
+                out = self.llm.complete("porter", "You port feature engineering "
+                                        "between model scripts precisely.", prompt)
+            except Exception:
+                continue
+            m = re.search(r"```(?:python)?\s*\n(.*?)```", out, re.S)
+            if not m or len(m.group(1).strip()) < 200:
+                continue
+            queued.append(store.queue(
+                self.conn, family=fam, parent_id=target["id"],
+                hypothesis=f"port of #{exp_id}: {exp['hypothesis'][:300]}",
+                change=f"port #{exp_id} to {fam}: {exp['change']}"[:70],
+                code=m.group(1).strip(), source="port", author="porter"))
+        return queued
 
     def clone(self) -> "Campaign":
         """Same campaign, own SQLite connection — for use from another thread."""
