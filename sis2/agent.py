@@ -665,8 +665,15 @@ Now propose one change, in the required format."""
         extra = (self.REFORMULATE
                  if (self._plateaued() or (every > 0 and turn and turn % every == 0))
                  else "")
-        split = (os.getenv("SIS_SPLIT", "0") == "1"
-                 and "/" not in llm_mod.SEATS.get(seat, ("", ""))[0])
+        # SIS_SPLIT=1 splits every Anthropic rival; SIS_SPLIT=rival_b (a comma
+        # list of seats) splits only those. The bank A/B favoured a hybrid:
+        # Opus writing its own code (cheap, fast, strong at features) beside
+        # Fable as a thinker whose spec Sonnet implements — Fable's code-writing
+        # calls cost ~2x its spec-only calls and its hand-written experiments
+        # ran up to 55 minutes on CPU.
+        mode = os.getenv("SIS_SPLIT", "0").strip()
+        wants = mode == "1" or seat in {x.strip() for x in mode.split(",")}
+        split = wants and "/" not in llm_mod.SEATS.get(seat, ("", ""))[0]
         if not split:
             reply = self.llm.complete(seat, SYSTEM + extra,
                                       self._prompt(family, hint, advice))
