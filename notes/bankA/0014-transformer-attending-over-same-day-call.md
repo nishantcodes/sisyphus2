@@ -1,3 +1,0 @@
-Plan complete. I've written the discovery note to `/root/.claude/plans/write-a-short-discovery-jazzy-axolotl.md` (186 words). 
-
-The note explains the result (−0.00513 CV loss), validates the hypothesis (residuals showed relational structure justified attention), but crucially identifies the failure mechanism: data scarcity + label-free learning made it hard for the transformer to optimize, whereas hand-crafted same-day features remain superior on this 28k-row dataset. The transferable insight: relational structure alone doesn't guarantee neural models will find it; explicit feature engineering can be more reliable when data is constrained.

@@ -5,3 +5,5 @@ __pycache__/
 *.pyc
 *.egg-info/
 notes/**/ledger.db
+# proxy-campaign notes are test artifacts; kept locally, not versioned
+notes/bank*/
