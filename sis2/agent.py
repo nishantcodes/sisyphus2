@@ -271,7 +271,7 @@ class Campaign:
         rows = store.history(self.conn, family, limit=30)
         if not rows:
             return "(nothing tried yet)"
-        out = ["  id | parent | verdict       |      CV |  +/-    | vs parent (paired) | change"]
+        out = ["  id | parent | verdict       |      CV |  +/-    | vs parent (paired) |  min | change"]
         for r in rows:
             if r["failure"]:
                 out.append(f"{r['id']:>4} | {str(r['parent_id'] or '-'):>6} | "
@@ -279,9 +279,11 @@ class Campaign:
             else:
                 vs = (f"{r['delta']:+.5f} t={r['delta_t']:+.1f}"
                       if r["delta"] is not None else "")
+                # Minutes of the full run: rivals budget compute from this.
                 out.append(f"{r['id']:>4} | {str(r['parent_id'] or '-'):>6} | "
                            f"{(r['verdict'] or '?'):<13} | {r['cv']:.5f} | "
-                           f"{(r['cv_std'] or 0):.5f} | {vs:<18} | {r['change'][:50]}")
+                           f"{(r['cv_std'] or 0):.5f} | {vs:<18} | "
+                           f"{(r['runtime_s'] or 0) / 60:>4.1f} | {r['change'][:50]}")
         return "\n".join(out)
 
     ADVISOR_ASK = (
@@ -904,12 +906,12 @@ variant that ties, because it adds information the ledger does not have.
         """Same campaign, own SQLite connection — for use from another thread."""
         return Campaign(self.home, self.llm, slug=self.slug, notes_dir=self.notes_dir)
 
-    def seed(self) -> list[str]:
-        """Queue and run the recipe baselines that are not in the ledger yet."""
+    def seed(self):
+        """Queue and run the recipe baselines not in the ledger yet, yielding
+        each result line as it lands (so the log shows progress)."""
         from . import recipes
         have = {r["change"] for r in self.conn.execute(
             "SELECT change FROM experiments WHERE source='recipe'")}
-        out = []
         for name in recipes.names():
             change = recipes.DESCRIPTIONS[name]
             if change in have:
@@ -917,8 +919,7 @@ variant that ties, because it adds information the ledger does not have.
             eid = store.queue(self.conn, family=name, hypothesis="standard baseline",
                               change=change, code=recipes.script(name),
                               source="recipe", author="(recipe)")
-            out.append(self.run_one(eid, "recipe"))
-        return out
+            yield self.run_one(eid, "recipe")
 
 
 def demo() -> None:

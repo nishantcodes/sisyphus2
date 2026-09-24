@@ -242,7 +242,7 @@ def history(conn, family: str = "", limit: int = 40) -> list[sqlite3.Row]:
     args = ((family, limit) if family else (limit,))
     return conn.execute(
         f"SELECT id,parent_id,family,change,cv,cv_std,verdict,author,failure,"
-        f"delta,delta_t "
+        f"delta,delta_t,runtime_s "
         f"FROM experiments WHERE status IN ('done','failed') {where} "
         f"ORDER BY id DESC LIMIT ?", args).fetchall()
 
