@@ -2,6 +2,70 @@
 
 What we did and why. Newest first. Not a spec — the code is the spec.
 
+## 2026-09-24 — cloud container, local boards, paired verdicts, role A/B
+
+**No route to Kaggle from the cloud container** (network policy 403s
+kaggle.com; no credentials). Rather than stop, built `local.py`: a
+hidden-label competition from a real dataset with a public/private board.
+`bank` is UCI bank marketing — the source s5e8 was synthesised from. Private
+scores go to a file the prompts never read. s6e9 work resumes the moment the
+environment allows kaggle.com.
+
+**The verdict rule was throwing away real gains.** It compared a mean gain to
+the raw fold spread, but every model shares the folds, so most of that spread
+is fold difficulty and cancels in a paired comparison. First bank turn: +0.0016
+against a 0.0027 spread → "inconclusive"; all five folds improved, paired t 6.3.
+On s6e9 the fold spread (0.0008) exceeded the top-10% band (0.0005), so the old
+rule could almost never say `better`. Now: paired t (one-sided 95%) AND an
+effect >= 5% of the fold spread. The second clause exists because a re-blend
+4e-7 higher on every fold passed a pure t-test and spent a slot.
+
+**Everything else built today, each from a measured failure:**
+
+* Linux support (`/proc/meminfo`), and `claude -p` children stripped of the
+  parent session's env — without it they resumed the operator's session.
+* Recipes: LGBM/XGB/CatBoost baselines at turn 0 with no LLM call.
+* Pipelining: proposal i+1 is written while experiment i trains.
+* Portfolio: nested-CV blend refreshed every turn, shown to rivals, and
+  eligible for submission; blends excluded from champion/analyst/novelty.
+* Multiclass end to end ((n, k) OOF; accuracy / MAP@k / logloss); regression
+  proxy `abalone` (RMSLE, s4e4's source) and multiclass `wine` (MAP@3).
+* Smoke runs check the OOF on harness-chosen rows (`$SIS_IDX`): bankB exp7's
+  misaligned NN (printed 0.943, array 0.502) was only caught after its full run.
+* Full-run bugs get one repair; the OOF check distinguishes per-fold scale
+  mismatch (ranking objectives) from misalignment.
+* Researcher seat: public notebooks → notes (ran on the five s6e9 notebooks;
+  surfaced the generator's income breakpoints and orig-data target-mean use).
+* Porter seat: a win is carried onto the other GBDT families automatically.
+* `sis2 finalize`: deterministic seed-bagging (2 of 3 bags paired-better on a
+  bankB copy); a bag supersedes its original in the blend pool.
+* Notes scoped per competition (`notes/<slug>/` + `notes/_global/`).
+
+**Role A/B on the bank proxy** (identical split/folds/recipe seed, 2 threads):
+
+| | turns | wins | fail | best single | blend | private of best-public pick | notional $ |
+|---|---|---|---|---|---|---|---|
+| A Opus + Fable, each writes code | 9 | 1 | 1 | 0.95135 | 0.95219 | **0.95462** | 30.39 |
+| B Opus + Fable decide, Sonnet codes | 12 | 3 | 1 | **0.95187** | 0.95219 | 0.95417 | 23.14 |
+| C Opus + Sonnet, each writes code | 12 | 1 | 1 | 0.95028 | 0.95100 | 0.95413 | **8.53** |
+| baseline (one LGBM, no agent) | – | – | – | 0.94947 | – | 0.95291 | 0 |
+
+Read with care — one campaign per arm, private differences of ~0.0005:
+
+* Every arm beat the no-agent baseline on the hidden private split by
+  +0.0012 to +0.0017. The loop adds held-out value.
+* A had the fewest single-model wins and the best private score: Fable's
+  neural nets (transformer 0.9462, PLR-MLP 0.9510) lost alone but decorrelated,
+  and the blend used them. Cost: one transformer ran 55 minutes on CPU.
+* B turned the most ideas into wins fastest; Fable's spec-only calls cost ~half
+  its code-writing calls.
+* C was cheapest and weakest on ideas.
+* Two of B's three wins were a rival hand-porting one feature set to other
+  families — the porter now does that.
+
+Next: D = hybrid (Opus writes its own code; Fable thinks, Sonnet implements;
+porter on), `SIS_SPLIT=rival_b`.
+
 ## 2026-09-02 — s6e9 live, advisor swarm
 
 **Rules accepted; campaign initialised.** 668,665 train / 286,571 test, 14
