@@ -973,6 +973,65 @@ Reply with ONLY the complete script in one ```python block.
                 code=m.group(1).strip(), source="port", author="porter"))
         return queued
 
+    SEED_RE = re.compile(r"\b(random_state|random_seed|seed|SEED|RANDOM_STATE)(\s*=\s*)(\d+)")
+
+    def bag(self, exp_id: int, seeds: int = 3) -> str:
+        """Seed-bag one experiment: rerun with shifted seeds, average the arrays.
+
+        Deterministic — no model call. Every `seed=`, `random_state=` and
+        `SEED =` literal in the script is shifted by the same offset, which
+        re-randomises bagging, feature sampling and NN init while keeping the
+        shared folds (they are loaded from disk, not seeded). The average is
+        recorded as its own experiment with the original as parent, so the
+        paired judge says whether bagging actually bought anything here.
+        """
+        import numpy as np
+        exp = self.conn.execute("SELECT * FROM experiments WHERE id=?",
+                                (exp_id,)).fetchone()
+        if exp is None or not exp["oof_path"] or exp["family"] == "blend":
+            return f"exp #{exp_id}: nothing to bag"
+        if not self.SEED_RE.search(exp["code"]):
+            return f"exp #{exp_id}: no seed literal to vary"
+        n_tr, n_te = self._row_counts()
+        oofs, preds = [np.load(exp["oof_path"])], [np.load(exp["pred_path"])]
+        for k in range(1, seeds):
+            code = self.SEED_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}"
+                                    f"{int(m.group(3)) + 1000 * k}", exp["code"])
+            res = run.run_local(code, self.home / f"exp{exp_id}_seed{k}", frac=1.0,
+                                data_dir=self.data, n_train=n_tr, n_test=n_te,
+                                y=self._y(), metric=self.metric)
+            if res.get("failure"):
+                return f"exp #{exp_id}: seed run {k} failed ({res['failure']})"
+            o = np.load(res["oof_path"])
+            if np.allclose(o, oofs[0]):
+                return f"exp #{exp_id}: seed change did not change the model"
+            oofs.append(o)
+            preds.append(np.load(res["pred_path"]))
+        wd = self.home / f"exp{exp_id}_bag"
+        wd.mkdir(parents=True, exist_ok=True)
+        oof, pred = np.mean(oofs, axis=0), np.mean(preds, axis=0)
+        np.save(wd / "oof.npy", oof)
+        np.save(wd / "test.npy", pred)
+        from . import blend
+        tcol = __import__("pandas").read_csv(self.data / "train.csv",
+                                             usecols=[self.target])[self.target]
+        blend.write_submission(pred, self.data, wd / "submission.csv", self.metric,
+                               metrics.classes(tcol) if np.ndim(pred) == 2 else None)
+        folds = np.load(self.data / "folds.npy")
+        fs = metrics.fold_scores(self._y(), oof, folds, self.metric)
+        eid = store.queue(self.conn, family=exp["family"], parent_id=exp_id,
+                          hypothesis=f"{seeds}-seed bag of #{exp_id}",
+                          change=f"{seeds}-seed bag of #{exp_id}: {exp['change']}"[:70],
+                          code=exp["code"], source="bag", author="(bag)")
+        v = store.finish(self.conn, eid, {
+            "cv": float(np.mean(fs)), "cv_std": float(np.std(fs)),
+            "oof_path": str(wd / "oof.npy"), "pred_path": str(wd / "test.npy"),
+            "submission_path": str(wd / "submission.csv")}, judge=self._judge)
+        row = self.conn.execute("SELECT cv, delta, delta_t FROM experiments WHERE id=?",
+                                (eid,)).fetchone()
+        return (f"exp #{eid} = {seeds}-seed bag of #{exp_id}: {v} "
+                f"({(row['delta'] or 0):+.5f}, t {(row['delta_t'] or 0):+.1f}) CV {row['cv']:.5f}")
+
     def clone(self) -> "Campaign":
         """Same campaign, own SQLite connection — for use from another thread."""
         return Campaign(self.home, self.llm, slug=self.slug, notes_dir=self.notes_dir)

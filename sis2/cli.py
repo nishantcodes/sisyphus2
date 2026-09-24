@@ -455,6 +455,31 @@ def cmd_research(a) -> None:
         print(f"  {w}")
 
 
+def cmd_finalize(a) -> None:
+    """Endgame: seed-bag the portfolio's heaviest members, then re-blend.
+
+    What the last days of a playground are spent on. Bags are ordinary
+    experiments (parent = the original), so the paired judge reports whether
+    bagging helped each one, and the portfolio picks them up like any model.
+    """
+    from . import blend, store
+    camp = _campaign(a.slug)
+    b = store.champion(camp.conn, "blend")
+    if b is not None:
+        ids = [int(x) for x in re.findall(r"#(\d+):", b["hypothesis"])][:a.top]
+    else:
+        ids = [r["id"] for r in camp.conn.execute(
+            "SELECT id FROM experiments WHERE status='done' AND family!='blend' "
+            f"ORDER BY cv {'DESC' if store.higher_is_better(camp.conn) else 'ASC'} "
+            "LIMIT ?", (a.top,))]
+    for eid in ids:
+        print(camp.bag(eid, a.seeds), flush=True)
+    print(blend.refresh_portfolio(camp.conn, camp.home, camp.data, judge=camp._judge)
+          or "portfolio unchanged")
+    if a.submit:
+        print(maybe_submit(camp, a.slug)[1])
+
+
 def cmd_compare(a) -> None:
     """Side-by-side of campaigns — for testing the AGENT, not the model.
 
@@ -623,6 +648,13 @@ def main() -> None:
     f.add_argument("--poll", type=int, default=45)
     f.add_argument("--timeout", type=int, default=5400)
     f.set_defaults(fn=cmd_fanout)
+
+    fz = sub.add_parser("finalize", help="seed-bag the portfolio's top members, re-blend")
+    fz.add_argument("slug")
+    fz.add_argument("--top", type=int, default=4)
+    fz.add_argument("--seeds", type=int, default=3)
+    fz.add_argument("--no-submit", dest="submit", action="store_false")
+    fz.set_defaults(fn=cmd_finalize, submit=True)
 
     cp = sub.add_parser("compare", help="side-by-side of campaigns (agent A/B)")
     cp.add_argument("slugs", nargs="+")
