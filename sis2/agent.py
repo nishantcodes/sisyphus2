@@ -932,6 +932,10 @@ variant that ties, because it adds information the ledger does not have.
             target = store.champion(self.conn, fam)
             if target is None:
                 continue
+            # Already carried over (a rival ported it by hand, as bankB's
+            # exp 21 did with exp 5): a second port can only tie.
+            if re.search(rf"#{exp_id}\b", f"{target['change']} {target['hypothesis']}"):
+                continue
             prompt = f"""A change just beat its parent (paired gain {exp['delta']:+.5f}, t {exp['delta_t']:+.1f}):
   "{exp['change']}"
 Port exactly that change onto the TARGET script below, which uses a different
