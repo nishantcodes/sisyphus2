@@ -137,6 +137,11 @@ def profile(data_dir: Path, target: str = "") -> str:
     for c in tr.columns:
         lines.append(f"{c:<{w}}  {str(tr[c].dtype):<9}  {tr[c].nunique():>9,}  "
                      f"{tr[c].isna().sum():>10,}")
+    ss = data_dir / "sample_submission.csv"
+    if ss.exists():
+        head = pd.read_csv(ss, nrows=2)
+        lines.append(f"\nsample_submission.csv columns: {list(head.columns)}; "
+                     f"first row: {head.iloc[0].to_dict()}")
     if not tr.isna().any().any():
         # Worth stating positively: it stops the agent inventing missingness
         # features (the s6e8 winner's headline trick) that cannot exist here.
@@ -160,6 +165,13 @@ def profile(data_dir: Path, target: str = "") -> str:
             if pos:
                 lines.append(f"  The positive class is `{pos}` (the minority). Map it "
                              f"to 1 and the other to 0, and predict P({pos}).")
+            elif len(vc) > 2:
+                order = sorted(str(v) for v in vc.index)
+                lines.append(f"  MULTICLASS ({len(vc)} labels). Encode as codes in "
+                             f"sorted order {order} and save OOF/PRED as (n, "
+                             f"{len(vc)}) probability matrices with columns in that "
+                             f"order. Write the submission in sample_submission.csv's "
+                             f"format (see its columns).")
     return "\n".join(lines)
 
 
@@ -183,6 +195,12 @@ def validate(sub_path: Path, data_dir: Path) -> tuple[bool, str]:
     for t in targets:                       # every label column, not just the first
         if sub[t].isna().any():
             return False, f"{t}: {sub[t].isna().sum()} NaN predictions"
+        if not pd.api.types.is_numeric_dtype(sub[t]):
+            # Class labels (argmax, or space-separated top-k for MAP@k). The
+            # numeric checks below do not apply; a constant column still does.
+            if sub[t].nunique() < 2 and len(sub) > 50:
+                return False, f"{t}: every row has the same label — constant?"
+            continue
         lo, hi = float(sub[t].min()), float(sub[t].max())
         if lo < -1e-9 or hi > 1 + 1e-9:
             # Only meaningful for probability targets; a regression sample
@@ -196,6 +214,8 @@ def validate(sub_path: Path, data_dir: Path) -> tuple[bool, str]:
             return False, (f"{t}: only {sub[t].nunique()} distinct predictions in "
                            f"{len(sub)} rows — constant?")
     t = targets[0]
+    if not pd.api.types.is_numeric_dtype(sub[t]):
+        return True, f"{len(sub)} rows, {t}: {sub[t].nunique()} distinct labels"
     return True, (f"{len(sub)} rows, {t} in [{sub[t].min():.4f}, {sub[t].max():.4f}], "
                   f"mean {sub[t].mean():.4f}, {sub[t].nunique()} distinct")
 

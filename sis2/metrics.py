@@ -47,9 +47,19 @@ def _rmsle(y, p):
     return float(np.sqrt(np.mean((np.log1p(y) - np.log1p(p)) ** 2)))
 
 
+def _map_k(metric: str) -> int:
+    """k for a MAP@k metric ("map@3", "MAP_3", "mean average precision @ 3"), else 0."""
+    import re
+    m = re.search(r"map\s*[@_]\s*(\d+)|average_precision_?@_?(\d+)",
+                  (metric or "").lower().replace(" ", "_"))
+    return int(m.group(1) or m.group(2)) if m else 0
+
+
 def _resolve(metric: str) -> tuple[str, bool]:
     # Spaces and hyphens both normalise to underscores, so "log loss",
     # "log-loss", and "logloss" are the same metric.
+    if _map_k(metric):
+        return ("_map_k", True)
     m = (metric or "").lower().strip().replace("-", "_").replace(" ", "_")
     for key, val in _TABLE.items():
         if key in m:
@@ -67,6 +77,8 @@ def score(y, p, metric: str = "auc") -> float:
     costs more than one that degrades to a sensible default."""
     y = np.asarray(y, dtype=float)
     p = np.asarray(p, dtype=float)
+    if p.ndim == 2:
+        return _score_multi(y, p, metric)
     name, _ = _resolve(metric)
     if not name:
         # Unknown metric: binary labels almost always mean AUC, otherwise RMSE.
@@ -85,6 +97,45 @@ def score(y, p, metric: str = "auc") -> float:
         return float("nan")
 
 
+def _score_multi(y, P, metric: str) -> float:
+    """Multiclass: y holds class codes 0..k-1, P is (n, k) probabilities.
+
+    Playground multiclass rounds have been scored by accuracy (s4e2), MAP@3
+    (s5e6) and multiclass log loss; every one of them is a function of the
+    probability matrix, so the contract asks for the matrix and the metric is
+    computed here rather than trusted from the script.
+    """
+    try:
+        yi = y.astype(int)
+        k = P.shape[1]
+        name, _ = _resolve(metric)
+        if name == "_map_k":
+            kk = _map_k(metric)
+            top = np.argsort(-P, axis=1)[:, :kk]
+            hit = top == yi[:, None]
+            return float((hit / np.arange(1, kk + 1)).sum(1).mean())
+        if name == "accuracy_score":
+            return float((P.argmax(1) == yi).mean())
+        if name in ("roc_auc_score",):
+            import sklearn.metrics as sk
+            return float(sk.roc_auc_score(yi, P / P.sum(1, keepdims=True),
+                                          multi_class="ovr", labels=list(range(k))))
+        if name == "f1_score":
+            import sklearn.metrics as sk
+            return float(sk.f1_score(yi, P.argmax(1), average="macro"))
+        # log loss, and the default for an unknown multiclass metric
+        q = np.clip(P / np.clip(P.sum(1, keepdims=True), 1e-15, None), 1e-15, 1)
+        return float(-np.log(q[np.arange(len(yi)), yi]).mean())
+    except Exception:
+        return float("nan")
+
+
+def direction_multi(metric: str) -> bool:
+    """Direction for a multiclass metric; unknown names default to log loss."""
+    name, hib = _resolve(metric)
+    return hib if name else False
+
+
 def demo() -> None:
     y = np.array([0, 0, 1, 1], dtype=float)
     perfect = np.array([0.1, 0.2, 0.8, 0.9])
@@ -97,7 +148,14 @@ def demo() -> None:
     assert score(y, perfect, "some_new_metric") == 1.0
     assert abs(score(np.array([1.0, 2.0]), np.array([1.0, 3.0]), "rmse") - 0.7071) < 1e-3
     assert np.isnan(score(y, np.array([np.nan] * 4), "auc"))
-    print("metrics.py: 7 checks passed")
+    # Multiclass: a (n, k) matrix and class codes.
+    ym = np.array([0, 1, 2, 2], dtype=float)
+    P = np.array([[.7, .2, .1], [.1, .6, .3], [.2, .5, .3], [.1, .1, .8]])
+    assert score(ym, P, "accuracy") == 0.75
+    assert abs(score(ym, P, "map@3") - (1 + 1 + 0.5 + 1) / 4) < 1e-9
+    assert direction("MAP@3") is True and _map_k("map@3") == 3
+    assert score(ym, P, "logloss") > 0
+    print("metrics.py: 11 checks passed")
 
 
 if __name__ == "__main__":
@@ -117,8 +175,25 @@ def encode_target(col):
     import pandas as pd
     if pd.api.types.is_numeric_dtype(col):
         return col.values.astype(float)
+    if col.nunique() > 2:
+        # Multiclass: codes in SORTED label order — the same order the data
+        # profile tells scripts to use for the columns of their (n, k) OOF.
+        return pd.Categorical(col.astype(str), categories=classes(col)).codes.astype(float)
     pos = col.value_counts().index[-1]          # minority class is the positive one
     return (col == pos).values.astype(float)
+
+
+def classes(col) -> list[str]:
+    """Class labels in the canonical (sorted, as strings) order."""
+    return sorted(col.dropna().astype(str).unique())
+
+
+def is_multiclass(col) -> bool:
+    """A non-numeric target with 3+ labels. Integer targets stay regression:
+    a count or a rating is ordered, and treating it as unordered classes
+    throws that away. Cast to strings to declare it categorical."""
+    import pandas as pd
+    return not pd.api.types.is_numeric_dtype(col) and col.nunique() > 2
 
 
 def fold_scores(y, p, folds, metric: str = "auc"):

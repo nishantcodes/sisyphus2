@@ -65,8 +65,12 @@ def cmd_init(a) -> None:
 
     if a.local and not (data / "train.csv").exists():
         from . import local
-        print(local.prepare(home, a.local, target=a.target, seed=a.seed))
-        a.target = a.target or local.KNOWN.get(a.local, {}).get("target", "")
+        known = local.KNOWN.get(a.local, {})
+        if a.metric == "auc" and known.get("metric"):
+            a.metric = known["metric"]       # the metric that playground used
+        print(local.prepare(home, a.local, target=a.target, seed=a.seed,
+                            metric=a.metric))
+        a.target = a.target or known.get("target", "")
     elif not (data / "train.csv").exists():
         ok, msg = kaggle.download(a.slug, data)
         print(msg)
@@ -114,7 +118,8 @@ def cmd_run(a) -> None:
     def after(line: str) -> None:
         print(f"{time.strftime('%H:%M:%S')} {line}", flush=True)
         try:
-            pl = blend.refresh_portfolio(camp.conn, camp.home, camp.data)
+            pl = blend.refresh_portfolio(camp.conn, camp.home, camp.data,
+                                         judge=camp._judge)
             if pl:
                 print(f"  {pl}", flush=True)
         except Exception as e:           # the portfolio must never stop a campaign
@@ -364,7 +369,8 @@ def cmd_blend(a) -> None:
     camp = _campaign(a.slug)
     ok, msg = blend.build(camp.conn, camp.home, camp.data, record=False)
     print(msg)
-    print("\n" + (blend.refresh_portfolio(camp.conn, camp.home, camp.data)
+    print("\n" + (blend.refresh_portfolio(camp.conn, camp.home, camp.data,
+                                          judge=camp._judge)
                   or "portfolio: nothing to blend yet"))
 
 
@@ -454,7 +460,7 @@ def cmd_check(a) -> None:
     """Run every module's self-check. One command to prove the install works."""
     import subprocess
     mods = ["metrics", "run", "store", "analyst", "kaggle", "llm", "agent",
-            "blend", "notify", "local"]
+            "blend", "notify", "local", "recipes"]
     bad = 0
     for m in mods:
         r = subprocess.run([sys.executable, "-m", f"sis2.{m}"],

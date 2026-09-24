@@ -40,6 +40,7 @@ from . import llm as llm_mod
 
 MAX_DEBUG_ROUNDS = 3       # a script that resists three fixes is a bad idea, not a typo
 SMOKE_FRAC = 0.05
+MIN_EFFECT = float(os.getenv("SIS_MIN_EFFECT", "0.05"))  # x fold spread; see _judge
 
 
 SYSTEM = """\
@@ -569,7 +570,13 @@ Now propose one change, in the required format."""
             return None
         m, se, t = metrics.paired(y, a, b, folds, self.metric)
         tc = metrics.t_crit(len(np.unique(folds)))
-        v = "better" if t > tc else "worse" if t < -tc else "inconclusive"
+        # Significance is not enough on its own: two near-identical blends
+        # differ by ~1e-7 on EVERY fold, which is a huge t and a worthless
+        # gain (it spent a real submission slot on the bank proxy). Require
+        # the effect to be a visible fraction of the fold spread as well.
+        floor = MIN_EFFECT * float(np.std(metrics.fold_scores(y, a, folds, self.metric)))
+        v = ("better" if t > tc and m > floor else
+             "worse" if t < -tc and -m > floor else "inconclusive")
         return v, m, t
 
     def _row_counts(self) -> tuple[int, int]:

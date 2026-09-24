@@ -49,6 +49,23 @@ KNOWN = {
         # it should be dropped for a realistic model. s5e8 kept it; so do we,
         # to stay faithful to the playground this stands in for.
     },
+    # s4e4 was synthesised from abalone and scored by RMSLE on Rings.
+    "abalone": {
+        "url": "https://raw.githubusercontent.com/jbrownlee/Datasets/master/abalone.csv",
+        "target": "Rings", "sep": ",", "header": None, "metric": "rmsle",
+        "names": ["Sex", "Length", "Diameter", "Height", "Whole_weight",
+                  "Shucked_weight", "Viscera_weight", "Shell_weight", "Rings"],
+    },
+    # Multiclass: quality as a LABEL (q3..q9), scored MAP@3 like s5e6.
+    "wine": {
+        "url": "https://raw.githubusercontent.com/jbrownlee/Datasets/master/winequality-white.csv",
+        "target": "quality", "sep": ",", "header": None, "metric": "map@3",
+        "as_label": "q",
+        "names": ["fixed_acidity", "volatile_acidity", "citric_acid",
+                  "residual_sugar", "chlorides", "free_sulfur_dioxide",
+                  "total_sulfur_dioxide", "density", "pH", "sulphates",
+                  "alcohol", "quality"],
+    },
     "adult": {
         "url": "https://raw.githubusercontent.com/jbrownlee/Datasets/master/adult-all.csv",
         "target": "income", "sep": ",", "header": None,
@@ -67,7 +84,7 @@ def is_local(home: Path) -> bool:
 
 
 def prepare(home: Path, source: str, *, target: str = "", test_frac: float = 0.3,
-            seed: int = 42) -> str:
+            seed: int = 42, metric: str = "") -> str:
     """Build a competition directory from a CSV (a path, a URL, or a KNOWN name).
 
     The split is stratified for categorical targets so the public board and CV
@@ -88,6 +105,8 @@ def prepare(home: Path, source: str, *, target: str = "", test_frac: float = 0.3
         kw.update(header=None, names=spec["names"])
     df = pd.read_csv(url, **kw)
     df = df.dropna(subset=[target]).reset_index(drop=True)
+    if spec.get("as_label"):
+        df[target] = spec["as_label"] + df[target].astype(str)
     for c in df.columns:              # "?" is UCI's missing marker; make it real
         if df[c].dtype == object:
             df[c] = df[c].astype(str).str.strip().replace({"?": np.nan})
@@ -106,7 +125,9 @@ def prepare(home: Path, source: str, *, target: str = "", test_frac: float = 0.3
     lb.mkdir(parents=True, exist_ok=True)
 
     from . import metrics
-    y_te = metrics.encode_target(pd.concat([tr[target], te[target]]))[len(tr):]
+    both = pd.concat([tr[target], te[target]])
+    y_te = metrics.encode_target(both)[len(tr):]
+    labels = metrics.classes(both) if metrics.is_multiclass(both) else []
     rng = np.random.default_rng(seed + 1)
     public = rng.random(len(te)) < PUBLIC_FRAC
     np.save(lb / "labels.npy", y_te)
@@ -116,10 +137,21 @@ def prepare(home: Path, source: str, *, target: str = "", test_frac: float = 0.3
     te.drop(columns=[target]).to_csv(data / "test.csv", index=False)
     # A constant sample submission, like Kaggle's. validate() compares ids and
     # columns against it, so it must use the real target name.
-    pd.DataFrame({"id": te["id"], target: 0.5}).to_csv(
-        data / "sample_submission.csv", index=False)
-    json.dump({"source": url, "target": target, "seed": seed,
-               "test_frac": test_frac, "public_frac": PUBLIC_FRAC},
+    metric = metric or spec.get("metric", "")
+    if labels and ("log" in metric.lower() or "entropy" in metric.lower()):
+        sample = pd.DataFrame({"id": te["id"],
+                               **{c: 1 / len(labels) for c in labels}})
+    elif labels:
+        kk = metrics._map_k(metric)
+        guess = " ".join(labels[:kk]) if kk else labels[0]
+        sample = pd.DataFrame({"id": te["id"], target: guess})
+    elif pd.api.types.is_numeric_dtype(tr[target]) and tr[target].nunique() > 2:
+        sample = pd.DataFrame({"id": te["id"], target: float(tr[target].mean())})
+    else:
+        sample = pd.DataFrame({"id": te["id"], target: 0.5})
+    sample.to_csv(data / "sample_submission.csv", index=False)
+    json.dump({"source": url, "target": target, "seed": seed, "labels": labels,
+               "metric": metric, "test_frac": test_frac, "public_frac": PUBLIC_FRAC},
               open(lb / "spec.json", "w"))
     return (f"local competition from {url}: train {len(tr):,}, test {len(te):,} "
             f"({int(public.sum()):,} public / {int((~public).sum()):,} private)")
@@ -134,8 +166,23 @@ def score(home: Path, sub_path: Path, metric: str) -> tuple[float, float]:
     public = np.load(home / ".lb" / "public.npy")
     sample = pd.read_csv(home / "input" / "sample_submission.csv")
     sub = pd.read_csv(sub_path)
-    id_col, tcol = sample.columns[0], sample.columns[1]
-    p = sub.set_index(id_col).loc[sample[id_col], tcol].values.astype(float)
+    id_col = sample.columns[0]
+    sub = sub.set_index(id_col).loc[sample[id_col]]
+    labels = json.load(open(home / ".lb" / "spec.json")).get("labels") or []
+    if len(sample.columns) > 2:                 # one probability column per class
+        p = sub[labels].values.astype(float)
+    elif labels:
+        # Label submissions: turn them back into a score matrix the metric can
+        # read. Top-k strings get descending pseudo-probabilities, so MAP@k
+        # and accuracy computed on the matrix equal the label-based values.
+        p = np.zeros((len(sub), len(labels)))
+        for i, s in enumerate(sub[sample.columns[1]].astype(str)):
+            for r, lab in enumerate(s.split()):
+                if lab in labels:
+                    p[i, labels.index(lab)] = max(p[i, labels.index(lab)], 1.0 / (r + 1))
+        p += 1e-9
+    else:
+        p = sub[sample.columns[1]].values.astype(float)
     return (metrics.score(y[public], p[public], metric),
             metrics.score(y[~public], p[~public], metric))
 

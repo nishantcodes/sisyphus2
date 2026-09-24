@@ -233,7 +233,7 @@ def _climb(X: np.ndarray, y: np.ndarray, metric: str, rounds: int) -> np.ndarray
     higher = metrics.direction(metric)
     k = X.shape[1]
     counts = np.zeros(k)
-    running = np.zeros(len(y))
+    running = np.zeros_like(X[:, 0], dtype=float)
     n, best = 0, (-np.inf if higher else np.inf)
     for _ in range(rounds):
         scores = np.array([metrics.score(y, (running * n + X[:, j]) / (n + 1), metric)
@@ -262,28 +262,57 @@ def cv_blend(y: np.ndarray, pool: list[dict], folds: np.ndarray, metric: str,
     """
     higher = metrics.direction(metric)
     pool = sorted(pool, key=lambda m: -m["cv"] if higher else m["cv"])[:POOL_CAP]
-    if _is_rank_metric(metric):
+    multi = np.ndim(pool[0]["oof"]) == 2
+    if _is_rank_metric(metric) and not multi:
         from scipy.stats import rankdata
         X = np.column_stack([rankdata(m["oof"]) / len(m["oof"]) for m in pool])
         T = np.column_stack([rankdata(m["pred"]) / len(m["pred"]) for m in pool])
     else:
-        X = np.column_stack([m["oof"] for m in pool])
-        T = np.column_stack([m["pred"] for m in pool])
-    oof = np.zeros(len(y))
+        # (n, members) for 1-D predictions, (n, members, k) for multiclass —
+        # the model axis is axis 1 either way, so selection code is shared.
+        X = np.stack([m["oof"] for m in pool], axis=1)
+        T = np.stack([m["pred"] for m in pool], axis=1)
+    oof = np.zeros_like(X[:, 0], dtype=float)
     fold_scores = []
     for k in np.unique(folds):
         va = folds == k
         w = _climb(X[~va], y[~va], metric, rounds)
-        oof[va] = X[va] @ w
+        oof[va] = np.tensordot(X[va], w, axes=([1], [0]))
         fold_scores.append(metrics.score(y[va], oof[va], metric))
     w = _climb(X, y, metric, rounds)
     solo = pool[0]["cv"]
     return {"cv": float(np.mean(fold_scores)), "cv_std": float(np.std(fold_scores)),
-            "oof": oof, "test": T @ w, "solo": solo,
+            "oof": oof, "test": np.tensordot(T, w, axes=([1], [0])), "solo": solo,
             "weights": {m["id"]: float(wi) for m, wi in zip(pool, w) if wi > 0}}
 
 
-def refresh_portfolio(conn, home: Path, data_dir: Path) -> str:
+def write_submission(pred: np.ndarray, data_dir: Path, path: Path, metric: str,
+                     labels: list[str] | None = None) -> None:
+    """Predictions -> a CSV shaped like sample_submission.csv.
+
+    1-D goes straight into the target column. A (n, k) matrix becomes one
+    probability column per class when the sample has them (log-loss rounds),
+    space-separated top-k labels for MAP@k, and the argmax label otherwise.
+    """
+    import pandas as pd
+    sample = pd.read_csv(data_dir / "sample_submission.csv")
+    if np.ndim(pred) == 1:
+        sample[sample.columns[1]] = pred
+    elif len(sample.columns) > 2:
+        cols = list(sample.columns[1:])
+        idx = [labels.index(str(c)) for c in cols]
+        sample[cols] = pred[:, idx]
+    else:
+        kk = metrics._map_k(metric)
+        order = np.argsort(-pred, axis=1)
+        if kk:
+            sample[sample.columns[1]] = [" ".join(labels[j] for j in r[:kk]) for r in order]
+        else:
+            sample[sample.columns[1]] = [labels[r[0]] for r in order]
+    sample.to_csv(path, index=False)
+
+
+def refresh_portfolio(conn, home: Path, data_dir: Path, judge=None) -> str:
     """Re-blend the pool; record a new `blend` row only when it is the best yet.
 
     Runs after every experiment, so the thing we would submit is always
@@ -320,9 +349,28 @@ def refresh_portfolio(conn, home: Path, data_dir: Path) -> str:
     wd.mkdir(parents=True, exist_ok=True)
     np.save(wd / "oof.npy", res["oof"])
     np.save(wd / "test.npy", res["test"])
-    sample = pd.read_csv(data_dir / "sample_submission.csv")
-    sample[sample.columns[1]] = res["test"]
-    sample.to_csv(wd / "submission.csv", index=False)
+    # A new portfolio row must beat the last one by the same paired rule a
+    # model must beat its parent. Without this, re-blending an unchanged pool
+    # produced a "better" blend 4e-7 higher and auto-submitted it.
+    if prev is not None:
+        verdict = None
+        if judge is not None:
+            try:
+                verdict = judge(prev["oof_path"], str(wd / "oof.npy"))
+            except Exception:
+                verdict = None
+        ok = (verdict[0] == "better") if verdict else \
+            abs(res["cv"] - prev["cv"]) > 1e-4 * max(abs(prev["cv"]), 1e-9)
+        if not ok:
+            import shutil
+            shutil.rmtree(wd, ignore_errors=True)
+            why = (f"paired {verdict[1]:+.6f} t {verdict[2]:+.1f}" if verdict
+                   else f"{res['cv'] - prev['cv']:+.6f}")
+            return (f"portfolio: blend {res['cv']:.6f} not clearly better than "
+                    f"exp #{prev['id']} ({why})")
+    tcol = pd.read_csv(data_dir / "train.csv", usecols=[target])[target]
+    write_submission(res["test"], data_dir, wd / "submission.csv", metric,
+                     metrics.classes(tcol) if np.ndim(res["test"]) == 2 else None)
     members = ", ".join(f"#{i}:{w:.2f}" for i, w in
                         sorted(res["weights"].items(), key=lambda kv: -kv[1]))
     eid = store.queue(conn, family="blend",

@@ -28,11 +28,16 @@ if FRAC < 1:
     idx = np.random.default_rng(SEED).choice(len(tr), max(200, int(len(tr) * FRAC)), replace=False)
     tr, folds = tr.iloc[idx].reset_index(drop=True), folds[idx]
 t = tr[TARGET]
+LABELS = []
 if pd.api.types.is_numeric_dtype(t) and t.nunique() > 2:
     TASK, y = "reg", t.values.astype(float)
+elif t.nunique() > 2:
+    LABELS = sorted(t.astype(str).unique())          # canonical column order
+    TASK, y = "multi", pd.Categorical(t.astype(str), categories=LABELS).codes.astype(int)
 else:
     pos = t.value_counts().index[-1]                 # minority class is positive
     TASK, y = "bin", (t == pos).values.astype(float)
+K = max(len(LABELS), 1)
 feats = [c for c in tr.columns if c not in ("id", TARGET)]
 cats = [c for c in feats if not pd.api.types.is_numeric_dtype(tr[c])]
 X, Xt = tr[feats].copy(), te[feats].copy()
@@ -43,29 +48,67 @@ for c in cats:
 
 def score(yy, pp):
     from sklearn import metrics as M
+    import re
     m = METRIC.lower()
+    if TASK == "multi":
+        mk = re.search(r"map\s*[@_]\s*(\d+)", m)
+        if mk:
+            kk = int(mk.group(1)); top = np.argsort(-pp, 1)[:, :kk]
+            return float(((top == yy[:, None]) / np.arange(1, kk + 1)).sum(1).mean())
+        if "acc" in m: return float((pp.argmax(1) == yy).mean())
+        return -M.log_loss(yy, pp, labels=list(range(K)))
     if "auc" in m: return M.roc_auc_score(yy, pp)
     if "log" in m: return -M.log_loss(yy, np.clip(pp, 1e-7, 1 - 1e-7))
     if "rmsle" in m: return -np.sqrt(np.mean((np.log1p(np.clip(yy, 0, None)) - np.log1p(np.clip(pp, 0, None))) ** 2))
     if "mae" in m: return -M.mean_absolute_error(yy, pp)
     if "rmse" in m or TASK == "reg": return -np.sqrt(np.mean((yy - pp) ** 2))
     return M.roc_auc_score(yy, pp)
-SIGN = -1 if any(k in METRIC.lower() for k in ("log", "rmse", "mae", "mse")) or (TASK == "reg" and "auc" not in METRIC.lower()) else 1
+if TASK == "multi":
+    SIGN = 1 if ("map" in METRIC.lower() or "acc" in METRIC.lower()) else -1
+else:
+    SIGN = -1 if any(k in METRIC.lower() for k in ("log", "rmse", "mae", "mse")) or (TASK == "reg" and "auc" not in METRIC.lower()) else 1
+
+def proba(m, Z):
+    if TASK == "bin": return m.predict_proba(Z)[:, 1]
+    if TASK == "multi": return m.predict_proba(Z)     # columns = classes present
+    return m.predict(Z)
 '''
 
 _TAIL = r'''
-oof, pred, scores = np.zeros(len(tr)), np.zeros(len(te)), []
+shape = (lambda n: (n, K)) if TASK == "multi" else (lambda n: n)
+oof, pred, scores = np.zeros(shape(len(tr))), np.zeros(shape(len(te))), []
 ks = np.unique(folds)
 for k in ks:
     va = folds == k
-    p_va, p_te = fit_predict(X[~va], y[~va], X[va], y[va], Xt)
+    if TASK == "multi":
+        # Boosters want contiguous labels 0..k'-1, and a small subsample (the
+        # 5% smoke run) routinely lacks a rare class. Fit on the classes that
+        # are present, then spread the columns back to all K.
+        present = np.unique(y[~va])
+        lut = -np.ones(K, int); lut[present] = np.arange(len(present))
+        ya, ye = lut[y[~va]], lut[y[va]]
+        keep = ye >= 0
+        pv, pt = fit_predict(X[~va], ya, X[va][keep], ye[keep], [X[va], Xt])
+        p_va, p_te = np.zeros((va.sum(), K)), np.zeros((len(Xt), K))
+        p_va[:, present], p_te[:, present] = pv, pt
+    else:
+        p_va, p_te = fit_predict(X[~va], y[~va], X[va], y[va], [X[va], Xt])
     oof[va] = p_va
     pred += p_te / len(ks)
     scores.append(SIGN * score(y[va], p_va))
 np.save(os.path.join(OUT, "oof.npy"), oof)
 np.save(os.path.join(OUT, "test.npy"), pred)
 sub = pd.read_csv(os.path.join(DATA, "sample_submission.csv"))
-sub[sub.columns[1]] = pred
+if TASK != "multi":
+    sub[sub.columns[1]] = pred
+elif len(sub.columns) > 2:
+    cols = list(sub.columns[1:]); sub[cols] = pred[:, [LABELS.index(str(c)) for c in cols]]
+else:
+    import re
+    mk = re.search(r"map\s*[@_]\s*(\d+)", METRIC.lower())
+    order = np.argsort(-pred, 1)
+    kk = int(mk.group(1)) if mk else 1
+    sub[sub.columns[1]] = [" ".join(LABELS[j] for j in r[:kk]) for r in order]
 sub.to_csv(os.path.join(OUT, "submission.csv"), index=False)
 print(f"CV_SCORE: {np.mean(scores):.6f}")
 print(f"CV_STD: {np.std(scores):.6f}")
@@ -75,44 +118,42 @@ print("OOF: oof.npy"); print("PRED: test.npy"); print("SUBMISSION: submission.cs
 _MODELS = {
     "lgbm": r'''
 import lightgbm as lgb
-def fit_predict(Xa, ya, Xv, yv, Xt):
+def fit_predict(Xa, ya, Xv, yv, outs):
     params = dict(n_estimators=5000, learning_rate=0.03, num_leaves=63,
                   min_child_samples=40, subsample=0.8, subsample_freq=1,
                   colsample_bytree=0.7, reg_lambda=1.0, max_bin=255,
                   random_state=SEED, n_jobs=THREADS, verbose=-1)
-    m = (lgb.LGBMClassifier if TASK == "bin" else lgb.LGBMRegressor)(**params)
+    m = (lgb.LGBMRegressor if TASK == "reg" else lgb.LGBMClassifier)(**params)
     m.fit(Xa, ya, eval_set=[(Xv, yv)], callbacks=[lgb.early_stopping(200, verbose=False)])
-    f = (lambda Z: m.predict_proba(Z)[:, 1]) if TASK == "bin" else m.predict
-    return f(Xv), f(Xt)
+    return [proba(m, Z) for Z in outs]
 ''',
     "xgb": r'''
 import xgboost as xgb
-def fit_predict(Xa, ya, Xv, yv, Xt):
+def fit_predict(Xa, ya, Xv, yv, outs):
     params = dict(n_estimators=5000, learning_rate=0.03, max_depth=7,
                   min_child_weight=5, subsample=0.8, colsample_bytree=0.7,
                   reg_lambda=1.0, tree_method="hist", enable_categorical=True,
                   max_cat_to_onehot=1, early_stopping_rounds=200,
                   random_state=SEED, n_jobs=THREADS)
-    m = (xgb.XGBClassifier if TASK == "bin" else xgb.XGBRegressor)(**params)
+    m = (xgb.XGBRegressor if TASK == "reg" else xgb.XGBClassifier)(**params)
     m.fit(Xa, ya, eval_set=[(Xv, yv)], verbose=False)
-    f = (lambda Z: m.predict_proba(Z)[:, 1]) if TASK == "bin" else m.predict
-    return f(Xv), f(Xt)
+    return [proba(m, Z) for Z in outs]
 ''',
     "catboost": r'''
 from catboost import CatBoostClassifier, CatBoostRegressor, Pool
-def fit_predict(Xa, ya, Xv, yv, Xt):
+def fit_predict(Xa, ya, Xv, yv, outs):
     def prep(Z):
         Z = Z.copy()
         for c in cats: Z[c] = Z[c].astype(str)
         return Z
-    params = dict(iterations=5000, learning_rate=0.05, depth=6,
+    params = dict(iterations=3000, learning_rate=0.08, depth=6,
                   l2_leaf_reg=3, random_seed=SEED, thread_count=THREADS,
                   od_type="Iter", od_wait=200, verbose=False)
-    m = (CatBoostClassifier if TASK == "bin" else CatBoostRegressor)(**params)
+    if TASK == "multi" and len(np.unique(ya)) > 2: params["loss_function"] = "MultiClass"
+    m = (CatBoostRegressor if TASK == "reg" else CatBoostClassifier)(**params)
     m.fit(Pool(prep(Xa), ya, cat_features=cats), eval_set=Pool(prep(Xv), yv, cat_features=cats),
           use_best_model=True)
-    f = (lambda Z: m.predict_proba(prep(Z))[:, 1]) if TASK == "bin" else (lambda Z: m.predict(prep(Z)))
-    return f(Xv), f(Xt)
+    return [proba(m, prep(Z)) for Z in outs]
 ''',
 }
 
@@ -160,7 +201,23 @@ def demo() -> None:
                               y=y, metric="auc", timeout=600)
             assert not r.get("failure"), (m, r)
             assert r["cv"] > 0.7, (m, r["cv"])
-    print(f"recipes.py: {len(names())} checks passed")
+        # Multiclass, MAP@3, with a rare class the smoke subsample will miss.
+        lab = np.where(x > 1.2, "hi", np.where(x < -1, "lo", np.where(c == "a", "a", "mid")))
+        lab[:3] = "rare"
+        df["t"] = lab
+        df.iloc[:900].to_csv(d / "train.csv", index=False)
+        pd.DataFrame({"id": df.id[900:], "t": "a hi lo"}).to_csv(d / "sample_submission.csv", index=False)
+        os.environ["SIS_METRIC"] = "map@3"
+        ym = metrics.encode_target(df.t[:900])
+        for m in names():
+            for frac in (0.25, 1.0):
+                r = run.run_local(script(m), d / f"{m}_mc{frac}", data_dir=d, frac=frac,
+                                  n_train=900 if frac == 1.0 else 0, n_test=300,
+                                  y=ym if frac == 1.0 else None, metric="map@3", timeout=600)
+                assert not r.get("failure"), (m, frac, r.get("error", "")[-800:])
+            assert np.load(r["oof_path"]).shape == (900, 5), m
+            assert r["cv"] > 0.6, (m, r["cv"])
+    print(f"recipes.py: {3 * len(names())} checks passed")
 
 
 if __name__ == "__main__":

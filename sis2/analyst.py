@@ -56,6 +56,12 @@ def row_loss(y: np.ndarray, p: np.ndarray, metric: str = "auc") -> np.ndarray:
     """
     y = np.asarray(y, dtype=float)
     p = np.asarray(p, dtype=float)
+    if p.ndim == 2:
+        # Multiclass: how little probability the true class got. Decomposes
+        # for every multiclass metric in use — accuracy, MAP@k and log loss
+        # all get worse exactly as this grows.
+        pt = p[np.arange(len(y)), y.astype(int)] / np.clip(p.sum(1), 1e-15, None)
+        return 1.0 - pt
     m = metric.lower()
     if "logloss" in m or "entropy" in m:
         eps = 1e-15
@@ -272,7 +278,7 @@ def disagreement(y: np.ndarray, a: np.ndarray, b: np.ndarray,
     worth keeping.
     """
     la, lb = row_loss(y, a, metric), row_loss(y, b, metric)
-    pred_corr = float(np.corrcoef(a, b)[0, 1])
+    pred_corr = float(np.corrcoef(np.ravel(a), np.ravel(b))[0, 1])
     err_corr = float(np.corrcoef(la, lb)[0, 1])
     lines = [f"prediction correlation {pred_corr:.4f}, ERROR correlation {err_corr:.4f}"]
     from .metrics import score
@@ -290,10 +296,30 @@ def disagreement(y: np.ndarray, a: np.ndarray, b: np.ndarray,
                      "different architecture or feature view is needed.")
     # Where they diverge most is a lead in itself.
     d = np.abs(a - b)
+    if d.ndim == 2:
+        d = d.sum(1)
     k = max(1, len(d) // 100)
     idx = np.argpartition(-d, k)[:k]
     lines.append(f"on the 1% of rows where they most disagree (n={len(idx)}): "
                  f"{name_a} loss {_fmt(la[idx].mean())}, {name_b} loss {_fmt(lb[idx].mean())}")
+    return "\n".join(lines)
+
+
+def per_class(y: np.ndarray, P: np.ndarray) -> str:
+    """Multiclass stand-in for calibration: which classes the model misses,
+    and which class it mistakes them for."""
+    yi = y.astype(int)
+    pred = P.argmax(1)
+    lines = ["class |      n | recall | mean p(true) | most confused with"]
+    for c in range(P.shape[1]):
+        m = yi == c
+        if not m.any():
+            continue
+        wrong = pred[m][pred[m] != c]
+        conf = (f"{np.bincount(wrong, minlength=P.shape[1]).argmax()} "
+                f"({len(wrong) / m.sum():.2f} of rows)") if len(wrong) else "-"
+        lines.append(f"{c:>5} | {m.sum():>6} | {(pred[m] == c).mean():>6.3f} | "
+                     f"{P[m, c].mean():>12.3f} | {conf}")
     return "\n".join(lines)
 
 
@@ -317,7 +343,8 @@ def report(X: pd.DataFrame, y: np.ndarray, oof: np.ndarray, *, metric: str = "au
         f"# Error analysis of the current champion",
         f"\n{metric} = {_fmt(score(y, oof, metric), 5)} on {len(y):,} rows, "
         f"mean per-row loss {_fmt(loss.mean())}",
-        "\n## 1. Calibration\n" + calibration(y, oof),
+        "\n## 1. Calibration\n" + (calibration(y, oof) if np.ndim(oof) == 1
+                                     else per_class(y, oof)),
         "\n## 2. Where the loss is concentrated\n" + worst_slices(Xa, loss),
         "\n## 3. Missingness\n" + missingness(Xa, loss, y),
         "\n## 4. Interactions\n" + interactions(Xa, loss),

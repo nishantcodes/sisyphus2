@@ -160,6 +160,9 @@ The script you write must:
 5. Save predictions into ${OUT_ENV} and print their names:
        OOF: oof.npy      (1-D, length == len(train), out-of-fold predictions)
        PRED: test.npy    (1-D, length == len(test), mean over fold models)
+   For a MULTICLASS target save (n, k) class-probability matrices instead,
+   columns in SORTED label order (sorted(str(label))). The harness scores the
+   matrix itself — accuracy, MAP@k, log loss — so do not save labels.
    These are mandatory. They are what later error analysis and the final
    ensemble are built from; an experiment without them cannot be studied or
    reused, and is worth far less than the compute it cost.
@@ -311,8 +314,10 @@ def _check_arrays(workdir: Path, res: dict, n_train: int, n_test: int) -> str:
             arr = np.load(p)
         except Exception as e:
             return f"{key}.npy will not load: {e}"
-        if arr.ndim != 1:
-            return f"{key} has shape {arr.shape}; must be 1-D"
+        # 1-D for binary and regression; (n, k) class probabilities for a
+        # multiclass target, columns in sorted-label order.
+        if arr.ndim not in (1, 2):
+            return f"{key} has shape {arr.shape}; must be 1-D, or (n, k) for multiclass"
         if want and len(arr) != want:
             return f"{key} has {len(arr)} rows, expected {want}"
         if not np.isfinite(arr).all():
