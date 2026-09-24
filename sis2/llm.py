@@ -86,12 +86,12 @@ COMPAT_SEATS = {s.strip() for s in
 # CLI aliases -> API model ids. The CLI takes short names; the API needs the
 # full id, and keeping the mapping here means a seat definition works on both.
 API_MODEL = {
-    "opus": "claude-opus-5",
+    "opus": "claude-opus-5-5",
     "sonnet": "claude-sonnet-5",
     "haiku": "claude-haiku-4-5",
-    # Fable 5.1 is API-ONLY: `claude -p --model claude-fable-5-1` returns
-    # "Claude Code 2.1.231 does not support" it, and the bare `fable` alias
-    # resolves to Fable 5. A fable seat must therefore run with SIS_BACKEND=api.
+    # Fable 5.1 was API-only on Claude Code 2.1.231; 2.1.281 serves
+    # `--model claude-fable-5-1` (verified). The bare `fable` alias resolves to
+    # Fable 5 on the CLI, so name the full id in a seat.
     "fable": "claude-fable-5-1",
     "fable-5": "claude-fable-5",
 }
@@ -110,6 +110,24 @@ class Throttled(RuntimeError):
 
 
 # ------------------------------------------------------------------ backends
+
+# Variables that bind a `claude` process to the session that launched it. When
+# sis2 itself runs inside Claude Code (a cloud session driving a campaign), the
+# child inherits them and reports the PARENT's session id — which the CLI
+# backend then stores and `--resume`s, appending rival turns to the operator's
+# own conversation. Measured in a cloud container: without stripping these the
+# child answered with the parent's session_id; with them stripped it got its own.
+_PARENT_SESSION_VARS = (
+    "CLAUDECODE", "CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_REMOTE_SESSION_ID",
+    "CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_TEE_SDK_STDOUT",
+    "CLAUDE_CODE_MESSAGING_SOCKET", "CLAUDE_CODE_MESSAGING_TOKEN",
+    "CLAUDE_CODE_SYNC_SESSION_REFS", "CLAUDE_CODE_POST_FOR_SESSION_INGRESS_V2",
+)
+
+
+def _child_env() -> dict[str, str]:
+    return {k: v for k, v in os.environ.items() if k not in _PARENT_SESSION_VARS}
+
 
 class CLIBackend:
     """Claude Code in headless mode, on the user's subscription.
@@ -161,13 +179,15 @@ class CLIBackend:
         # cache saving; the cheap ones keep their model.
         sid = None if seat in ("debugger", "reporter") else self._sessions.get(seat)
         cmd = base + (["--resume", sid] if sid else [])
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=CLI_TIMEOUT)
+        env = _child_env()
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=CLI_TIMEOUT, env=env)
         # A stored session can vanish (cleared history, another machine). That
         # is not an error worth failing a turn over — start a fresh one.
         if sid and proc.returncode != 0:
             self._sessions.pop(seat, None)
             proc = subprocess.run(base, capture_output=True, text=True,
-                                  timeout=CLI_TIMEOUT)
+                                  timeout=CLI_TIMEOUT, env=env)
         raw = proc.stdout.strip()
         if proc.returncode != 0 or not raw:
             err = (proc.stderr or raw or "")[-500:]
@@ -204,7 +224,8 @@ class APIBackend:
     name = "api"
 
     # $ per million tokens: (input, output), cached 2026-06-24.
-    PRICES = {"claude-opus-5": (5.0, 25.0), "claude-fable-5": (10.0, 50.0),
+    PRICES = {"claude-opus-5": (5.0, 25.0), "claude-opus-5-5": (5.0, 25.0),
+              "claude-fable-5": (10.0, 50.0),
               # 5.1 assumed at Fable-5 rates until published; tokens are
               # stored raw so the whole history reprices if that is wrong.
               "claude-fable-5-1": (10.0, 50.0),

@@ -76,6 +76,12 @@ def open_db(home: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(home / "ledger.db", timeout=30)
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
+    # Columns added after ledgers already existed. ALTER is idempotent here
+    # only because we check first; an old ledger must keep opening.
+    have = {r["name"] for r in conn.execute("PRAGMA table_info(experiments)")}
+    for col, decl in (("delta", "REAL"), ("delta_t", "REAL")):
+        if col not in have:
+            conn.execute(f"ALTER TABLE experiments ADD COLUMN {col} {decl}")
     conn.commit()
     return conn
 
@@ -122,7 +128,8 @@ def mark_running(conn, exp_id: int) -> None:
     conn.commit()
 
 
-def verdict_for(conn, exp_id: int, cv: float, cv_std: float) -> str:
+def verdict_for(conn, exp_id: int, cv: float, cv_std: float,
+                judge=None, oof_path: str = "") -> str:
     """Compare against the parent, with the fold spread as the noise floor.
 
     A run with no parent is a `baseline`. A gain smaller than the spread is
@@ -132,10 +139,23 @@ def verdict_for(conn, exp_id: int, cv: float, cv_std: float) -> str:
     row = conn.execute("SELECT cv, cv_std FROM experiments WHERE id=?",
                        (exp_id,)).fetchone()
     parent = conn.execute(
-        "SELECT cv, cv_std FROM experiments e WHERE e.id="
+        "SELECT cv, cv_std, oof_path FROM experiments e WHERE e.id="
         "(SELECT parent_id FROM experiments WHERE id=?)", (exp_id,)).fetchone()
     if parent is None or parent["cv"] is None:
         return "baseline"
+    # The paired test, when the caller can supply one. It compares the two
+    # OOF arrays fold by fold on the shared folds, which cancels fold
+    # difficulty — see metrics.paired for the measurement that motivated it.
+    if judge is not None and oof_path and parent["oof_path"]:
+        try:
+            out = judge(parent["oof_path"], oof_path)
+        except Exception:
+            out = None
+        if out is not None:
+            v, delta, t = out
+            conn.execute("UPDATE experiments SET delta=?, delta_t=? WHERE id=?",
+                         (delta, t, exp_id))
+            return v
     # Noise floor is the larger of the two spreads: comparing a tight run to a
     # noisy parent is only as trustworthy as the noisier of the pair.
     floor = max(cv_std or 0.0, parent["cv_std"] or 0.0)
@@ -149,7 +169,7 @@ def verdict_for(conn, exp_id: int, cv: float, cv_std: float) -> str:
     return "inconclusive"
 
 
-def finish(conn, exp_id: int, result: dict) -> str:
+def finish(conn, exp_id: int, result: dict, judge=None) -> str:
     """Record a completed run and return its verdict ('' when it failed)."""
     if result.get("failure"):
         conn.execute(
@@ -165,7 +185,8 @@ def finish(conn, exp_id: int, result: dict) -> str:
         (result["cv"], result["cv_std"], result.get("oof_path", ""),
          result.get("pred_path", ""), result.get("submission_path", ""),
          result.get("runtime_s", 0), time.time(), exp_id))
-    v = verdict_for(conn, exp_id, result["cv"], result["cv_std"])
+    v = verdict_for(conn, exp_id, result["cv"], result["cv_std"], judge,
+                    result.get("oof_path", ""))
     conn.execute("UPDATE experiments SET verdict=? WHERE id=?", (v, exp_id))
     conn.commit()
     return v
@@ -178,12 +199,29 @@ def champion(conn, family: str = "") -> sqlite3.Row | None:
     ordering respects the metric direction so the same code works for AUC and
     RMSE alike.
     """
+    # Blends are excluded unless asked for by name. A blend is not a model
+    # anyone can extend, and the analyst studying one would diagnose "where
+    # the average of everything is wrong" — which no single proposal can fix.
     order = "DESC" if higher_is_better(conn) else "ASC"
-    where = "AND family=?" if family else ""
+    where = "AND family=?" if family else "AND family != 'blend'"
     args = (family,) if family else ()
     return conn.execute(
         f"SELECT * FROM experiments WHERE status='done' AND cv IS NOT NULL "
         f"AND oof_path != '' {where} ORDER BY cv {order} LIMIT 1", args).fetchone()
+
+
+def best_candidate(conn) -> sqlite3.Row | None:
+    """The best thing we could SUBMIT: a single model or a portfolio blend.
+
+    Separate from champion() on purpose. The champion is what the next
+    proposal builds on; the candidate is what goes to the board. For a medal
+    they are usually different objects — the board wants the ensemble, the
+    research loop wants the strongest single model to study.
+    """
+    order = "DESC" if higher_is_better(conn) else "ASC"
+    return conn.execute(
+        f"SELECT * FROM experiments WHERE status='done' AND cv IS NOT NULL "
+        f"AND submission_path != '' ORDER BY cv {order} LIMIT 1").fetchone()
 
 
 def families(conn) -> list[str]:
@@ -203,7 +241,8 @@ def history(conn, family: str = "", limit: int = 40) -> list[sqlite3.Row]:
     where = "AND family=?" if family else ""
     args = ((family, limit) if family else (limit,))
     return conn.execute(
-        f"SELECT id,parent_id,family,change,cv,cv_std,verdict,author,failure "
+        f"SELECT id,parent_id,family,change,cv,cv_std,verdict,author,failure,"
+        f"delta,delta_t "
         f"FROM experiments WHERE status IN ('done','failed') {where} "
         f"ORDER BY id DESC LIMIT ?", args).fetchall()
 

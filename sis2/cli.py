@@ -63,7 +63,11 @@ def cmd_init(a) -> None:
     home.mkdir(parents=True, exist_ok=True)
     data = home / "input"
 
-    if not (data / "train.csv").exists():
+    if a.local and not (data / "train.csv").exists():
+        from . import local
+        print(local.prepare(home, a.local, target=a.target, seed=a.seed))
+        a.target = a.target or local.KNOWN.get(a.local, {}).get("target", "")
+    elif not (data / "train.csv").exists():
         ok, msg = kaggle.download(a.slug, data)
         print(msg)
         if not ok:
@@ -71,6 +75,8 @@ def cmd_init(a) -> None:
     else:
         print(f"data already present in {data}")
 
+    if not a.target:
+        sys.exit("--target is required (it can be omitted only for a known --local dataset)")
     conn = store.open_db(home)
     store.set_meta(conn, slug=a.slug, metric=a.metric, target=a.target,
                    higher_is_better="1" if __import__(
@@ -78,7 +84,7 @@ def cmd_init(a) -> None:
                    families=a.families)
     print(kaggle.make_folds(data, n_folds=a.folds, seed=a.seed, target=a.target))
 
-    board = kaggle.leaderboard(a.slug, home)
+    board = {} if a.local else kaggle.leaderboard(a.slug, home)
     if board.get("known"):
         line = (f"Leaderboard: {board['teams']} teams, top {board['top']:.5f}, "
                 f"top-10% {board['p10']:.5f}, median {board['median']:.5f}")
@@ -110,6 +116,12 @@ def cmd_run(a) -> None:
         seat = seats[i % len(seats)]        # the rivalry: alternate the proposer
         line = camp.turn(seat, turn_no=i)
         print(f"{time.strftime('%H:%M:%S')} {line}", flush=True)
+        try:
+            pl = blend.refresh_portfolio(camp.conn, camp.home, camp.data)
+            if pl:
+                print(f"  {pl}", flush=True)
+        except Exception as e:           # the portfolio must never stop a campaign
+            print(f"  portfolio failed: {str(e)[:120]}", flush=True)
 
         if a.submit:
             sent, why = maybe_submit(camp, a.slug)
@@ -131,24 +143,49 @@ def cmd_run(a) -> None:
 def maybe_submit(camp, slug: str) -> tuple[bool, str]:
     """The auto-submit rule. Returns (sent, explanation)."""
     from . import kaggle, store
-    champ = store.champion(camp.conn)
+    # The best SUBMITTABLE thing, blends included — the board wants the
+    # ensemble even though the research loop studies single models.
+    champ = store.best_candidate(camp.conn)
     if champ is None or not champ["submission_path"]:
-        return False, "no champion with a submission file"
+        return False, "no candidate with a submission file"
     already = camp.conn.execute(
         "SELECT 1 FROM submissions WHERE experiment_id=?", (champ["id"],)).fetchone()
     if already:
         return False, "champion already submitted"
 
-    prior = camp.conn.execute(
-        "SELECT MAX(cv) hi, MIN(cv) lo FROM submissions").fetchone()
     higher = store.higher_is_better(camp.conn)
-    best_sent = (prior["hi"] if higher else prior["lo"]) if prior else None
-    floor = champ["cv_std"] or 0.0
-    if best_sent is not None:
-        gain = (champ["cv"] - best_sent) if higher else (best_sent - champ["cv"])
-        if gain <= floor:
-            return False, (f"champion beats the best submitted CV by {gain:+.5f}, "
-                           f"inside the {floor:.5f} fold spread — not worth a slot")
+    prev = camp.conn.execute(
+        "SELECT e.* FROM submissions s JOIN experiments e ON e.id=s.experiment_id "
+        f"ORDER BY e.cv {'DESC' if higher else 'ASC'} LIMIT 1").fetchone()
+    if prev is not None:
+        gain = (champ["cv"] - prev["cv"]) if higher else (prev["cv"] - champ["cv"])
+        # Paired test against the best thing already on the board: a slot is
+        # spent only on a candidate that beats it consistently fold by fold.
+        judged = None
+        if prev["oof_path"] and champ["oof_path"]:
+            try:
+                judged = camp._judge(prev["oof_path"], champ["oof_path"])
+            except Exception:
+                judged = None
+        if judged is not None:
+            v, delta, t = judged
+            if v != "better":
+                return False, (f"candidate #{champ['id']} vs submitted #{prev['id']}: "
+                               f"{delta:+.5f} (paired t {t:+.1f}) — not a clear "
+                               f"enough gain to spend a slot")
+        else:
+            floor = champ["cv_std"] or 0.0
+            if gain <= floor:
+                return False, (f"candidate beats the best submitted CV by {gain:+.5f}, "
+                               f"inside the {floor:.5f} fold spread — not worth a slot")
+
+    from . import local
+    if local.is_local(camp.home):
+        cap = int(os.getenv("SIS_LOCAL_DAILY", "5"))
+        used = local.submissions_today(camp.home)
+        if used >= cap:
+            return False, f"{used}/{cap} daily local submissions already used"
+        return local.submit(camp.conn, camp.home, dict(champ), camp.data)
 
     used = kaggle.submissions_today(slug)
     if used >= 5:
@@ -240,7 +277,7 @@ def cmd_fanout(a) -> None:
             bad = run._oof_agrees(res["oof_path"], camp._y(), camp.metric, res["cv"])
             if bad:
                 res = {"failure": "bug", "error": bad}
-        verdict = store.finish(camp.conn, eid, res)
+        verdict = store.finish(camp.conn, eid, res, judge=camp._judge)
         if res.get("failure"):
             print(f"  exp #{eid} FAILED ({res['failure']}): {str(res.get('error'))[:80]}")
         else:
@@ -264,15 +301,27 @@ def cmd_submit(a) -> None:
         else store.champion(camp.conn)
     if exp is None:
         sys.exit("no such experiment")
-    ok, msg = kaggle.submit(camp.conn, a.slug, dict(exp), camp.data)
+    from . import local
+    if local.is_local(camp.home):
+        ok, msg = local.submit(camp.conn, camp.home, dict(exp), camp.data)
+    else:
+        ok, msg = kaggle.submit(camp.conn, a.slug, dict(exp), camp.data)
     print(msg)
+
+
+def cmd_private(a) -> None:
+    """Local competitions only: every submission's hidden private score."""
+    from . import local
+    print(local.private_report(_home(a.slug)))
 
 
 def cmd_blend(a) -> None:
     from . import blend
     camp = _campaign(a.slug)
-    ok, msg = blend.build(camp.conn, camp.home, camp.data)
+    ok, msg = blend.build(camp.conn, camp.home, camp.data, record=False)
     print(msg)
+    print("\n" + (blend.refresh_portfolio(camp.conn, camp.home, camp.data)
+                  or "portfolio: nothing to blend yet"))
 
 
 def cmd_finals(a) -> None:
@@ -361,7 +410,7 @@ def cmd_check(a) -> None:
     """Run every module's self-check. One command to prove the install works."""
     import subprocess
     mods = ["metrics", "run", "store", "analyst", "kaggle", "llm", "agent",
-            "blend", "notify"]
+            "blend", "notify", "local"]
     bad = 0
     for m in mods:
         r = subprocess.run([sys.executable, "-m", f"sis2.{m}"],
@@ -379,7 +428,12 @@ def main() -> None:
 
     i = sub.add_parser("init", help="download data, freeze folds, read the board")
     i.add_argument("slug")
-    i.add_argument("--target", required=True, help="name of the label column")
+    i.add_argument("--target", default="", help="name of the label column")
+    i.add_argument("--local", default="",
+                   help="build a LOCAL competition from a CSV path/URL or a "
+                        "known name (bank, adult) instead of downloading from "
+                        "Kaggle; test labels stay hidden, submissions are "
+                        "scored on a public/private split")
     i.add_argument("--metric", default="auc")
     i.add_argument("--folds", type=int, default=10)
     i.add_argument("--seed", type=int, default=42)
@@ -403,7 +457,8 @@ def main() -> None:
     for name, fn, helptext in (("status", cmd_status, "where the campaign is"),
                                ("blend", cmd_blend, "build the ensemble"),
                                ("finals", cmd_finals, "which two to mark final"),
-                               ("ping", cmd_ping, "test the Telegram channel")):
+                               ("ping", cmd_ping, "test the Telegram channel"),
+                               ("private", cmd_private, "local only: private scores")):
         s = sub.add_parser(name, help=helptext)
         s.add_argument("slug")
         s.set_defaults(fn=fn)

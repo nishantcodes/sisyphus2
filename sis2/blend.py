@@ -37,7 +37,8 @@ def _load_pool(conn) -> list[dict]:
     rows = conn.execute(
         "SELECT id, family, change, cv, cv_std, oof_path, pred_path "
         "FROM experiments WHERE status='done' AND cv IS NOT NULL "
-        "AND oof_path != '' AND pred_path != '' ORDER BY id").fetchall()
+        "AND oof_path != '' AND pred_path != '' AND family != 'blend' "
+        "ORDER BY id").fetchall()
     pool, n_oof, n_pred = [], None, None
     for r in rows:
         try:
@@ -165,7 +166,7 @@ def hill_climb(y: np.ndarray, pool: list[dict], metric: str,
             "test": test, "oof": running, "report": "\n".join(lines)}
 
 
-def build(conn, home: Path, data_dir: Path) -> tuple[bool, str]:
+def build(conn, home: Path, data_dir: Path, record: bool = True) -> tuple[bool, str]:
     """Blend everything in the ledger and write a submission for it."""
     import pandas as pd
     target = store.meta(conn, "target", "")
@@ -198,6 +199,12 @@ def build(conn, home: Path, data_dir: Path) -> tuple[bool, str]:
     sub = wd / "submission.csv"
     sample.to_csv(sub, index=False)
 
+    if not record:
+        # The in-sample report is useful to read; recording it is not. Its
+        # score is an upper bound with no fold spread, and a cv_std of 0.0
+        # lets it beat any submission under the noise-floor rule. The honest
+        # nested version is `refresh_portfolio`.
+        return True, res["report"]
     # Record the blend as a real experiment so it can be submitted, compared,
     # and extended like anything else — it is not a special case.
     eid = store.queue(conn, family="blend",
@@ -209,6 +216,126 @@ def build(conn, home: Path, data_dir: Path) -> tuple[bool, str]:
                              "pred_path": str(wd / "test.npy"),
                              "submission_path": str(sub), "runtime_s": 0.0})
     return True, f"exp #{eid}\n{res['report']}"
+
+
+# ---------------------------------------------------------------- portfolio
+
+POOL_CAP = int(__import__("os").getenv("SIS_PORTFOLIO_CAP", "16"))
+PORTFOLIO_ROUNDS = 30
+
+
+def _is_rank_metric(metric: str) -> bool:
+    return metrics._resolve(metric)[0] in ("roc_auc_score", "average_precision_score")
+
+
+def _climb(X: np.ndarray, y: np.ndarray, metric: str, rounds: int) -> np.ndarray:
+    """Caruana selection on a matrix; returns non-negative weights summing to 1."""
+    higher = metrics.direction(metric)
+    k = X.shape[1]
+    counts = np.zeros(k)
+    running = np.zeros(len(y))
+    n, best = 0, (-np.inf if higher else np.inf)
+    for _ in range(rounds):
+        scores = np.array([metrics.score(y, (running * n + X[:, j]) / (n + 1), metric)
+                           for j in range(k)])
+        scores = np.where(np.isfinite(scores), scores, -np.inf if higher else np.inf)
+        j = int(np.argmax(scores) if higher else np.argmin(scores))
+        gain = (scores[j] - best) if higher else (best - scores[j])
+        if n and gain < MIN_GAIN:
+            break
+        running = (running * n + X[:, j]) / (n + 1)
+        n += 1
+        counts[j] += 1
+        best = scores[j]
+    return counts / counts.sum()
+
+
+def cv_blend(y: np.ndarray, pool: list[dict], folds: np.ndarray, metric: str,
+             rounds: int = PORTFOLIO_ROUNDS) -> dict:
+    """A blend whose CV is honest: weights for fold k are chosen WITHOUT fold k.
+
+    `rank_optimise` picks weights on the same rows it then scores, so its
+    number is an upper bound, and `build` recorded it with cv_std 0.0 — which
+    the auto-submit rule reads as "no noise floor", i.e. any blend beats any
+    submission. Nested selection gives a per-fold score with a real spread, so
+    the blend competes with single models under the SAME rule they obey.
+    """
+    higher = metrics.direction(metric)
+    pool = sorted(pool, key=lambda m: -m["cv"] if higher else m["cv"])[:POOL_CAP]
+    if _is_rank_metric(metric):
+        from scipy.stats import rankdata
+        X = np.column_stack([rankdata(m["oof"]) / len(m["oof"]) for m in pool])
+        T = np.column_stack([rankdata(m["pred"]) / len(m["pred"]) for m in pool])
+    else:
+        X = np.column_stack([m["oof"] for m in pool])
+        T = np.column_stack([m["pred"] for m in pool])
+    oof = np.zeros(len(y))
+    fold_scores = []
+    for k in np.unique(folds):
+        va = folds == k
+        w = _climb(X[~va], y[~va], metric, rounds)
+        oof[va] = X[va] @ w
+        fold_scores.append(metrics.score(y[va], oof[va], metric))
+    w = _climb(X, y, metric, rounds)
+    solo = pool[0]["cv"]
+    return {"cv": float(np.mean(fold_scores)), "cv_std": float(np.std(fold_scores)),
+            "oof": oof, "test": T @ w, "solo": solo,
+            "weights": {m["id"]: float(wi) for m, wi in zip(pool, w) if wi > 0}}
+
+
+def refresh_portfolio(conn, home: Path, data_dir: Path) -> str:
+    """Re-blend the pool; record a new `blend` row only when it is the best yet.
+
+    Runs after every experiment, so the thing we would submit is always
+    current. A row is written only when the honest blend beats both the best
+    single model and every earlier blend — otherwise the ledger fills with
+    near-identical blends nobody can learn from.
+    """
+    import pandas as pd
+    if __import__("os").getenv("SIS_PORTFOLIO", "1") == "0":
+        return ""
+    target = store.meta(conn, "target", "")
+    metric = store.meta(conn, "metric", "auc")
+    pool = _load_pool(conn)
+    if len(pool) < 2:
+        return ""
+    y = metrics.encode_target(pd.read_csv(data_dir / "train.csv",
+                                          usecols=[target])[target])
+    folds = np.load(data_dir / "folds.npy")
+    if len(pool[0]["oof"]) != len(y) or len(folds) != len(y):
+        return ""
+    res = cv_blend(y, pool, folds, metric)
+    higher = metrics.direction(metric)
+    better = (lambda a, b: a > b) if higher else (lambda a, b: a < b)
+    prev = store.champion(conn, "blend")
+    single = store.champion(conn)
+    if not better(res["cv"], single["cv"]):
+        return (f"portfolio: honest blend {res['cv']:.6f} does not beat the best "
+                f"single model {single['cv']:.6f}")
+    if prev is not None and not better(res["cv"], prev["cv"]):
+        return f"portfolio: blend {res['cv']:.6f} is no better than exp #{prev['id']}"
+
+    n = conn.execute("SELECT COUNT(*) FROM experiments WHERE family='blend'").fetchone()[0]
+    wd = home / "portfolio" / f"v{n + 1}"
+    wd.mkdir(parents=True, exist_ok=True)
+    np.save(wd / "oof.npy", res["oof"])
+    np.save(wd / "test.npy", res["test"])
+    sample = pd.read_csv(data_dir / "sample_submission.csv")
+    sample[sample.columns[1]] = res["test"]
+    sample.to_csv(wd / "submission.csv", index=False)
+    members = ", ".join(f"#{i}:{w:.2f}" for i, w in
+                        sorted(res["weights"].items(), key=lambda kv: -kv[1]))
+    eid = store.queue(conn, family="blend",
+                      hypothesis=f"nested-CV hill climb; weights {members}",
+                      change=f"portfolio blend of {len(res['weights'])} models",
+                      code="# built by sis2.blend.refresh_portfolio",
+                      source="operator", author="(portfolio)")
+    store.finish(conn, eid, {"cv": res["cv"], "cv_std": res["cv_std"],
+                             "oof_path": str(wd / "oof.npy"),
+                             "pred_path": str(wd / "test.npy"),
+                             "submission_path": str(wd / "submission.csv")})
+    return (f"portfolio: exp #{eid} blend CV {res['cv']:.6f} +/- {res['cv_std']:.6f} "
+            f"(best single {single['cv']:.6f}) — {members}")
 
 
 def demo() -> None:
@@ -253,7 +380,19 @@ def demo() -> None:
     r3 = hill_climb(y, rmse_pool, "rmse")
     assert r3["oof_score"] < min(m["cv"] for m in rmse_pool), r3["report"]
 
-    print("blend.py: 5 checks passed")
+    # The nested blend's CV must be honest: on a diverse pool it still beats
+    # the best member, and it reports a real (non-zero) fold spread.
+    folds = np.arange(n) % 5
+    cb = cv_blend(y, pool, folds, "auc")
+    assert cb["cv"] > max(m["cv"] for m in pool) - 0.002, cb
+    assert cb["cv_std"] > 0, cb
+    # Pure-noise members cannot buy an honest gain over a real model.
+    junk = [pool[0]] + [{"id": 10 + i, "family": "f", "change": "noise", "cv": 0.5,
+                         "oof": rng.random(n), "pred": rng.random(n)} for i in range(4)]
+    cj = cv_blend(y, junk, folds, "auc")
+    assert cj["cv"] <= pool[0]["cv"] + 0.002, cj
+
+    print("blend.py: 7 checks passed")
 
 
 if __name__ == "__main__":

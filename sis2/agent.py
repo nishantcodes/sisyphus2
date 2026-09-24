@@ -8,7 +8,7 @@ plainly before the code:
         brief     = analyst.report(champion)        # WHERE it is losing
         proposal  = rival.propose(brief, notes, history)
         result    = run(proposal)                   # smoke at 5%, then full
-        verdict   = compare against parent, with the fold spread as noise floor
+        verdict   = paired fold-by-fold test against the parent
         if better: write a discovery note, consider submitting
 
 v1's loop was `select a node by UCT, mutate it, score it`. That is a search over
@@ -87,8 +87,10 @@ experiments — every experiment already saves its out-of-fold predictions, and 
 combining them is done separately whenever it is wanted. A blend teaches nothing \
 about the problem; your job is to produce a single model that is either better \
 or differently wrong than what exists.
-- Chasing gains smaller than the fold spread. They are noise and they will not \
-reproduce on the leaderboard.
+- Chasing gains that do not survive the paired test. Every experiment is \
+compared to its parent fold by fold on the shared folds (the `vs parent` \
+column: mean delta and paired t). A gain that is not consistent across folds \
+is noise and will not reproduce on the leaderboard.
 - Ignoring the discovery notes and re-deriving something a previous campaign \
 already settled.
 
@@ -140,8 +142,8 @@ decision has to carry everything they need.
 
 Choose ONE change to ONE model, aimed at a weakness the error analysis actually \
 shows. Not a plausible-sounding improvement — a targeted response to a measured \
-failure. Chasing gains smaller than the fold spread is worthless; they will not \
-reproduce on the leaderboard.
+failure. Gains that are not consistent fold by fold (the paired t in the \
+ledger) are worthless; they will not reproduce on the leaderboard.
 
 Reply in EXACTLY this format and nothing else:
 
@@ -240,7 +242,8 @@ class Campaign:
             champ_loss = analyst.row_loss(y, oof, self.metric)
             for r in self.conn.execute(
                     "SELECT id, change, oof_path FROM experiments WHERE status='done' "
-                    "AND oof_path != '' AND id != ?", (champ["id"],)):
+                    "AND oof_path != '' AND family != 'blend' AND id != ?",
+                    (champ["id"],)):
                 try:
                     ro = np.load(r["oof_path"])
                 except Exception:
@@ -264,15 +267,17 @@ class Campaign:
         rows = store.history(self.conn, family, limit=30)
         if not rows:
             return "(nothing tried yet)"
-        out = ["  id | parent | verdict       |      CV |  +/-    | change"]
+        out = ["  id | parent | verdict       |      CV |  +/-    | vs parent (paired) | change"]
         for r in rows:
             if r["failure"]:
                 out.append(f"{r['id']:>4} | {str(r['parent_id'] or '-'):>6} | "
                            f"FAILED ({r['failure']})".ljust(40) + f"| {r['change'][:50]}")
             else:
+                vs = (f"{r['delta']:+.5f} t={r['delta_t']:+.1f}"
+                      if r["delta"] is not None else "")
                 out.append(f"{r['id']:>4} | {str(r['parent_id'] or '-'):>6} | "
                            f"{(r['verdict'] or '?'):<13} | {r['cv']:.5f} | "
-                           f"{(r['cv_std'] or 0):.5f} | {r['change'][:50]}")
+                           f"{(r['cv_std'] or 0):.5f} | {vs:<18} | {r['change'][:50]}")
         return "\n".join(out)
 
     ADVISOR_ASK = (
@@ -465,6 +470,11 @@ Now propose one change, in the required format."""
         """
         if os.getenv("SIS_GPU", "auto") == "off":
             return False
+        # A local competition has no Kaggle to push to — its data exists only
+        # here, so a kernel would run against nothing.
+        from . import local
+        if local.is_local(self.home):
+            return False
         # Detect the opt-in the contract describes. Matching the ACTUAL GPU
         # switches rather than the family label matters: an `nn` experiment
         # written with sklearn's MLPClassifier gains nothing from a T4, while
@@ -536,6 +546,25 @@ Now propose one change, in the required format."""
         # than one element is ambiguous" and killed a 40-turn run on turn 1.
         # Compare against the sentinel explicitly.
         return None if self._y_cache is False else self._y_cache
+
+    def _judge(self, parent_oof: str, oof: str):
+        """Paired fold-by-fold verdict: (verdict, mean delta, t) or None.
+
+        None means "cannot judge this way" (arrays missing or misaligned),
+        and the store falls back to the old spread rule rather than guessing.
+        """
+        import numpy as np
+        y = self._y()
+        if y is None:
+            return None
+        folds = np.load(self.data / "folds.npy")
+        a, b = np.load(oof), np.load(parent_oof)
+        if not (len(a) == len(b) == len(y) == len(folds)):
+            return None
+        m, se, t = metrics.paired(y, a, b, folds, self.metric)
+        tc = metrics.t_crit(len(np.unique(folds)))
+        v = "better" if t > tc else "worse" if t < -tc else "inconclusive"
+        return v, m, t
 
     def _row_counts(self) -> tuple[int, int]:
         try:
@@ -691,7 +720,8 @@ variant that ties, because it adds information the ledger does not have.
         import numpy as np
         rows = self.conn.execute(
             "SELECT id, change, cv, oof_path FROM experiments WHERE status='done' "
-            "AND oof_path != '' ORDER BY cv DESC LIMIT 12").fetchall()
+            "AND oof_path != '' AND family != 'blend' ORDER BY cv "
+            f"{'DESC' if store.higher_is_better(self.conn) else 'ASC'} LIMIT 12").fetchall()
         y = self._y()
         if y is None or len(rows) < 2:
             return "(too few scored models to measure novelty yet)"
@@ -787,7 +817,7 @@ variant that ties, because it adds information the ledger does not have.
 
         store.mark_running(self.conn, exp_id)
         res = self._execute(exp_id, code)
-        verdict = store.finish(self.conn, exp_id, res)
+        verdict = store.finish(self.conn, exp_id, res, judge=self._judge)
         if res.get("failure"):
             return (f"[{seat}] exp #{exp_id} [{family}] FAILED ({res['failure']}): "
                     f"{res.get('error', '')[:160]}")

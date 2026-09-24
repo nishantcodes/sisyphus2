@@ -69,9 +69,18 @@ def available_gb() -> float:
     """Free + inactive + speculative pages, i.e. what a new process can take.
 
     `Pages free` alone badly understates macOS headroom — inactive pages are
-    reclaimable and routinely dwarf free ones. Returns 0.0 if vm_stat cannot be
-    read, which callers treat as "unknown, do not gate".
+    reclaimable and routinely dwarf free ones. On Linux (cloud containers,
+    Kaggle kernels) `MemAvailable` in /proc/meminfo is the same idea, computed
+    by the kernel. Returns 0.0 if neither can be read, which callers treat as
+    "unknown, do not gate".
     """
+    try:
+        with open("/proc/meminfo", encoding="ascii") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) / 1024 ** 2
+    except OSError:
+        pass
     try:
         out = subprocess.run(["vm_stat"], capture_output=True, text=True,
                              timeout=5).stdout
@@ -170,10 +179,11 @@ The script you write must:
        XGBClassifier(device="cuda", tree_method="hist")
        CatBoostClassifier(task_type="GPU")
        LGBMClassifier(device="gpu")
-   **$SIS_DEVICE is ALWAYS set, locally too.** On this machine it is "mps"
-   (Apple GPU) — use it for any torch work: `torch.device(os.environ["SIS_DEVICE"])`.
-   A CPU-only neural net on 668k rows x 10 folds does not finish inside the
-   timeout; one experiment already died that way.
+   **$SIS_DEVICE is ALWAYS set, locally too** — "cuda", "mps" (Apple GPU) or
+   "cpu", whatever this machine has. Use it for any torch work:
+   `torch.device(os.environ["SIS_DEVICE"])`. A CPU-only neural net on 668k
+   rows x 10 folds does not finish inside the timeout; one experiment already
+   died that way.
    On a GPU kernel the harness probes the hardware and sets $SIS_DEVICE to
    "cuda" or "cpu". USE IT — `torch.device(os.environ.get("SIS_DEVICE","cpu"))`
    — never hardcode "cuda". Kaggle does not always hand out the accelerator
