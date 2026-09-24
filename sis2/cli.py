@@ -446,6 +446,65 @@ def cmd_research(a) -> None:
         print(f"  {w}")
 
 
+def cmd_compare(a) -> None:
+    """Side-by-side of campaigns — for testing the AGENT, not the model.
+
+    Best single CV, best blend, best public and (local only) private score,
+    turns, failures, and what the model calls cost. The comparison that
+    decides seat assignments and role splits.
+    """
+    import json as _json
+
+    from . import local, store
+    rows = []
+    for slug in a.slugs:
+        home = _home(slug)
+        conn = store.open_db(home)
+        hib = store.higher_is_better(conn)
+        agg = "MAX" if hib else "MIN"
+        q = lambda sql: conn.execute(sql).fetchone()[0]
+        agent_rows = "source NOT IN ('recipe','operator')"
+        n = q(f"SELECT COUNT(*) FROM experiments WHERE {agent_rows} "
+              f"AND status IN ('done','failed')")
+        fails = q(f"SELECT COUNT(*) FROM experiments WHERE {agent_rows} AND status='failed'")
+        wins = q(f"SELECT COUNT(*) FROM experiments WHERE {agent_rows} AND verdict='better'")
+        single = q(f"SELECT {agg}(cv) FROM experiments WHERE status='done' AND family!='blend'")
+        blendv = q(f"SELECT {agg}(cv) FROM experiments WHERE status='done' AND family='blend'")
+        pub = store.best_lb(conn)
+        priv_best, priv_last = None, None
+        pf = home / ".lb" / "private.jsonl"
+        if local.is_local(home) and pf.exists():
+            subs = [_json.loads(x) for x in pf.read_text().splitlines() if x.strip()]
+            if subs:
+                priv_last = subs[-1]["private"]
+                # What a competitor would actually be scored on: the private
+                # score of the submission with the best PUBLIC score.
+                pick = (max if hib else min)(subs, key=lambda r: r["public"])
+                priv_best = pick["private"]
+        usd, calls, secs = 0.0, 0, 0.0
+        up = home / "usage.jsonl"
+        if up.exists():
+            for ln in up.read_text().splitlines():
+                try:
+                    r = _json.loads(ln)
+                except ValueError:
+                    continue
+                usd += r.get("usd", 0.0)
+                calls += 1
+                secs += r.get("latency_s", 0.0)
+        wall = q("SELECT MAX(finished_at) - MIN(created_at) FROM experiments") or 0
+        rows.append((slug, n, wins, fails, single, blendv, pub, priv_best, priv_last,
+                     usd, calls, wall / 60))
+    f = lambda v, d=5: "-" if v is None else f"{v:.{d}f}"
+    print(f"{'campaign':<12} {'turns':>5} {'wins':>4} {'fail':>4} {'single':>9} "
+          f"{'blend':>9} {'public':>9} {'priv@pub':>9} {'priv last':>9} "
+          f"{'$ notnl':>8} {'calls':>5} {'min':>5}")
+    for r in rows:
+        print(f"{r[0]:<12} {r[1]:>5} {r[2]:>4} {r[3]:>4} {f(r[4]):>9} {f(r[5]):>9} "
+              f"{f(r[6]):>9} {f(r[7]):>9} {f(r[8]):>9} {r[9]:>8.2f} {r[10]:>5} "
+              f"{r[11]:>5.0f}")
+
+
 def cmd_hint(a) -> None:
     """Steer the campaign from the terminal.
 
@@ -555,6 +614,10 @@ def main() -> None:
     f.add_argument("--poll", type=int, default=45)
     f.add_argument("--timeout", type=int, default=5400)
     f.set_defaults(fn=cmd_fanout)
+
+    cp = sub.add_parser("compare", help="side-by-side of campaigns (agent A/B)")
+    cp.add_argument("slugs", nargs="+")
+    cp.set_defaults(fn=cmd_compare)
 
     rs = sub.add_parser("research", help="study public notebooks into notes")
     rs.add_argument("slug")
