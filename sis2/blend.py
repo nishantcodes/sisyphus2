@@ -38,6 +38,12 @@ def _load_pool(conn) -> list[dict]:
         "SELECT id, family, change, cv, cv_std, oof_path, pred_path "
         "FROM experiments WHERE status='done' AND cv IS NOT NULL "
         "AND oof_path != '' AND pred_path != '' AND family != 'blend' "
+        # A seed-bagged model supersedes its original: the two are near
+        # duplicates, and carrying both made the nested selection noisier —
+        # on bankB the re-blend with bags AND originals scored 0.95204 vs
+        # 0.95219 without bags, although two of three bags were paired-better.
+        "AND id NOT IN (SELECT parent_id FROM experiments WHERE source='bag' "
+        "AND status='done' AND parent_id IS NOT NULL) "
         "ORDER BY id").fetchall()
     pool, n_oof, n_pred = [], None, None
     for r in rows:
