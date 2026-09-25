@@ -41,6 +41,9 @@ SEATS: dict[str, tuple[str, str]] = {
     # correctly, but a full id is honoured on BOTH backends, so use it.
     "debugger": (os.getenv("SIS_DEBUGGER", "claude-haiku-4-5"), "low"),
     "reporter": (os.getenv("SIS_REPORTER", "claude-haiku-4-5"), "low"),
+    # The last repair attempt (agent._repair): contract-level faults the cheap
+    # debugger failed twice on.
+    "debugger_strong": (os.getenv("SIS_DEBUGGER_STRONG", "claude-sonnet-5"), "medium"),
     # Writes the script from the thinker's spec when SIS_SPLIT=1.
     "executor": (os.getenv("SIS_EXECUTOR", "claude-sonnet-5"), "medium"),
     # Reads public notebooks and writes discovery notes (research.py). A
@@ -189,7 +192,7 @@ class CLIBackend:
         # whatever model created it — 24 debugger calls configured as `haiku`
         # were served by claude-sonnet-5 this way. The big seats keep the 5.7x
         # cache saving; the cheap ones keep their model.
-        sid = None if seat in ("debugger", "reporter") else self._sessions.get(seat)
+        sid = None if seat in ("debugger", "debugger_strong", "reporter") else self._sessions.get(seat)
         cmd = base + (["--resume", sid] if sid else [])
         env = _child_env()
         proc = subprocess.run(cmd, capture_output=True, text=True,

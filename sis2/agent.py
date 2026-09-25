@@ -424,7 +424,7 @@ Now propose one change, in the required format."""
                 res["error"] = (f"still failing after {MAX_DEBUG_ROUNDS} repair "
                                 f"attempts: {res.get('error', '')}")
                 return res
-            fixed = self._repair(code, res)
+            fixed = self._repair(code, res, attempt)
             if not fixed:
                 return res
             code = fixed
@@ -547,14 +547,25 @@ Now propose one change, in the required format."""
             time.sleep(wait)
         return run.system_ok(wd)[0]
 
-    def _repair(self, code: str, res: dict) -> str:
+    def _repair(self, code: str, res: dict, attempt: int = 0) -> str:
+        """Fix a failing script. The LAST attempt escalates to a stronger seat.
+
+        Three campaigns lost an experiment with all repairs spent on Haiku,
+        each time on a contract-level fault rather than a typo — not using the
+        harness's smoke rows ($SIS_IDX), a class missing from a fold, per-fold
+        score scales. Cheap first, capable last: the escalation costs one
+        mid-tier call only when the cheap seat has already failed twice.
+        """
+        seat = "debugger" if attempt < MAX_DEBUG_ROUNDS - 1 else "debugger_strong"
         prompt = (f"This script failed with `{res['failure']}`. Fix it and return "
                   f"ONLY the corrected script in one ```python block — no "
                   f"explanation.\n\nDo not change what the experiment is testing; "
-                  f"fix only what broke.\n\nError:\n{res.get('error', '')[:3000]}"
+                  f"fix only what broke. It must still satisfy this contract:\n"
+                  f"{run.CONTRACT[:2500] if seat == 'debugger_strong' else ''}"
+                  f"\n\nError:\n{res.get('error', '')[:3000]}"
                   f"\n\nScript:\n```python\n{code}\n```")
         try:
-            out = self.llm.complete("debugger", "You fix Python scripts.", prompt)
+            out = self.llm.complete(seat, "You fix Python scripts.", prompt)
         except Exception:
             return ""
         m = re.search(r"```(?:python)?\s*\n(.*?)```", out, re.S)
