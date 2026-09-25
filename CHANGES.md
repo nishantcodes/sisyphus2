@@ -73,6 +73,12 @@ its "wins" added no blend diversity; `compare` no longer counts ports/bags as
 wins; `sis2 run --total N` resumes to N agent turns after a restart. Final
 table and recommendation: ARCHITECTURE.md §4.
 
+Replicated on UCI adult: the hybrid WITHOUT the porter beat competitors by
++0.00258 private (CI +0.00176..+0.00341). Defaults changed to match: rival_b =
+Fable 5.1 unless `SIS_RIVAL_B=off`, `SIS_SPLIT=rival_b`, executor Sonnet 5.
+Also: a model call that fails on every backend now reports each backend's
+error — two adult turns died showing only the API fallback's auth error.
+
 ## 2026-09-02 — s6e9 live, advisor swarm
 
 **Rules accepted; campaign initialised.** 668,665 train / 286,571 test, 14

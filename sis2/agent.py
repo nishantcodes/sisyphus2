@@ -671,7 +671,7 @@ Now propose one change, in the required format."""
         # Fable as a thinker whose spec Sonnet implements — Fable's code-writing
         # calls cost ~2x its spec-only calls and its hand-written experiments
         # ran up to 55 minutes on CPU.
-        mode = os.getenv("SIS_SPLIT", "0").strip()
+        mode = os.getenv("SIS_SPLIT", "rival_b").strip()
         wants = mode == "1" or seat in {x.strip() for x in mode.split(",")}
         split = wants and "/" not in llm_mod.SEATS.get(seat, ("", ""))[0]
         if not split:

@@ -50,8 +50,8 @@ a verdict row, a discovery note, a hint.
 | seat | job | default model | why this model |
 |---|---|---|---|
 | `rival_a` | propose one change + write the code | Opus 5.5 | judgement is the product |
-| `rival_b` | same, alternating turns | Fable 5.1 | a *different* prior; two copies of one model is one expensive agent |
-| `executor` | write code from a spec (only with `SIS_SPLIT`) | Sonnet 5 | see §4 |
+| `rival_b` | propose one change as a SPEC (thinker), alternating turns | Fable 5.1 | a *different* prior; its tokens go on judgement, not boilerplate (§4) |
+| `executor` | write rival_b's code from its spec (`SIS_SPLIT=rival_b`, default) | Sonnet 5 | measured best (§4) |
 | `porter` | carry a win onto other GBDT families (opt-in `SIS_PORT=1`) | Sonnet 5 | see §4 |
 | `debugger` | repair a failing script (≤3x per experiment) | Haiku 4.5 | reads a traceback; runs most turns |
 | `reporter` | write the discovery note | Haiku 4.5 | low stakes, high volume |
@@ -110,8 +110,27 @@ What that supports:
 4. **Automatic porting** (D) inflates the win count without adding portfolio
    diversity, so it is off by default (`SIS_PORT=1` to enable).
 
-Caveat stated plainly: one campaign per arm on one small dataset. A second
-proxy (UCI adult) replication is the next measurement.
+**Replication on a second proxy (UCI adult, 34k train rows)** — competitors
+(A) against the hybrid WITHOUT the porter (Opus codes; Fable decides, Sonnet
+implements), 10 turns each:
+
+| adult | turns | wins | best single | blend | private |
+|---|---|---|---|---|---|
+| A competitors | 10 | 0 | 0.92943 | 0.93077 | 0.93122 |
+| hybrid, no porter | 8 | 3 | **0.93233** | **0.93275** | **0.93379** |
+
+Bootstrap on the private rows: hybrid − A = +0.00258, 95% CI +0.00176 to
++0.00341 — the largest significant gap measured. The winning idea (treat
+`capital_gain`/`capital_loss` as categoricals, +0.00286 at t=17.7, then +0.0108
+when Opus carried it into its MLP) came from Fable deciding and Sonnet writing.
+
+**Across both proxies the consistent reading:** the hybrid wins when the
+porter is off (adult) and loses when it is on (bank D); full split (bank B)
+tied the competitors. So the defaults are now the hybrid — `rival_a` = Opus
+5.5 writing its own code, `rival_b` = Fable 5.1 as a thinker
+(`SIS_SPLIT=rival_b`), `executor` = Sonnet 5 — with the porter off. Two
+campaigns per arm is still small; the table is re-measured whenever the
+seats change.
 
 ## 5. Judging and submitting
 

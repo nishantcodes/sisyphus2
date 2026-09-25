@@ -34,7 +34,7 @@ from pathlib import Path
 # because they fail differently — one creative, one careful — and a rivalry
 # between two instances of the same model is just a more expensive single agent.
 SEATS: dict[str, tuple[str, str]] = {
-    "rival_a":  (os.getenv("SIS_RIVAL_A", "opus"), "high"),
+    "rival_a":  (os.getenv("SIS_RIVAL_A", "claude-opus-5-5"), "high"),
     # FULL model ids, not short aliases. `claude -p --model haiku` silently
     # resolves to claude-sonnet-5 — it does not error, it just serves a bigger
     # model. 24 debugger calls ran that way. `opus` and `sonnet` do resolve
@@ -42,7 +42,7 @@ SEATS: dict[str, tuple[str, str]] = {
     "debugger": (os.getenv("SIS_DEBUGGER", "claude-haiku-4-5"), "low"),
     "reporter": (os.getenv("SIS_REPORTER", "claude-haiku-4-5"), "low"),
     # Writes the script from the thinker's spec when SIS_SPLIT=1.
-    "executor": (os.getenv("SIS_EXECUTOR", "sonnet"), "medium"),
+    "executor": (os.getenv("SIS_EXECUTOR", "claude-sonnet-5"), "medium"),
     # Reads public notebooks and writes discovery notes (research.py). A
     # reading-comprehension job, not a judgement one — mid-tier is enough.
     "researcher": (os.getenv("SIS_RESEARCHER", "claude-sonnet-5"), "medium"),
@@ -61,8 +61,14 @@ SEATS: dict[str, tuple[str, str]] = {
 # seat. rival_b used to be unconditional with a "sonnet" default, so
 # commenting out SIS_RIVAL_B silently swapped Nemotron for Sonnet instead of
 # retiring the seat — the same word meaning two different things.
-if os.getenv("SIS_RIVAL_B"):
-    SEATS["rival_b"] = (os.environ["SIS_RIVAL_B"], "high")
+#
+# rival_b now DEFAULTS to Fable 5.1 — the measured best configuration (see
+# ARCHITECTURE.md §4: Opus writes its own code, Fable decides and Sonnet
+# implements; SIS_SPLIT defaults to "rival_b"). Retire the seat explicitly
+# with SIS_RIVAL_B=off; an unset variable no longer means "no seat".
+_rb = os.getenv("SIS_RIVAL_B", "claude-fable-5-1").strip()
+if _rb and _rb.lower() not in ("off", "none", "0"):
+    SEATS["rival_b"] = (_rb, "high")
 
 if os.getenv("SIS_RIVAL_C"):
     SEATS["rival_c"] = (os.environ["SIS_RIVAL_C"], "high")
@@ -506,7 +512,15 @@ class LLM:
             order = [self._compat] + order
 
         last = None
+        # Every backend's error, not just the last one. On adult-hybrid two
+        # turns died with only the API fallback's "could not resolve
+        # authentication" visible — the CLI failure that caused the fallback
+        # was swallowed, so the real cause was unrecoverable.
+        errors: list[str] = []
         for backend in [b for b in order if b is not None]:
+            if last is not None:
+                errors.append(f"{getattr(prev, 'name', '?')}: {str(last)[:300]}")
+            prev = backend
             if backend.name == "api" and self.spend_today() >= DAILY_CAP_USD:
                 last = RuntimeError(
                     f"API daily cap reached (${self.spend_today():.2f} of "
@@ -531,7 +545,9 @@ class LLM:
             self._record(seat, backend.name, usage, time.perf_counter() - t0,
                          experiment_id)
             return text
-        raise RuntimeError(f"no backend could answer: {last}")
+        if last is not None:
+            errors.append(f"{getattr(prev, 'name', '?')}: {str(last)[:300]}")
+        raise RuntimeError("no backend could answer: " + " | ".join(errors))
 
     def advise(self, system: str, user: str) -> str:
         """Ask an outside model for ideas. Returns '' if none answers.
