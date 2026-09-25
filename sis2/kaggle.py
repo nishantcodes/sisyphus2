@@ -175,6 +175,13 @@ def profile(data_dir: Path, target: str = "") -> str:
                              f"{len(vc)}) probability matrices with columns in that "
                              f"order. Write the submission in sample_submission.csv's "
                              f"format (see its columns).")
+                lines.append("  RARE CLASSES: a smoke subsample or a fold can lack a "
+                             "class entirely, and XGBoost/LightGBM reject labels that "
+                             "are not 0..k'-1. Fit each fold on the classes present "
+                             "(remap y to contiguous codes), then write the predicted "
+                             "columns back into a full (n, k) matrix with zeros for "
+                             "absent classes. A wine run died three repairs deep on "
+                             "exactly this.")
     return "\n".join(lines)
 
 

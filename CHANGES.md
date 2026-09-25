@@ -79,6 +79,14 @@ Fable 5.1 unless `SIS_RIVAL_B=off`, `SIS_SPLIT=rival_b`, executor Sonnet 5.
 Also: a model call that fails on every backend now reports each backend's
 error — two adult turns died showing only the API fallback's auth error.
 
+**Generality, with the default (hybrid) seats, 8 agent turns each:** wine
+(multiclass, MAP@3) private 0.78748 → 0.80466; abalone (regression, RMSLE)
+0.17079 → 0.16493. Rivals used the (n, k) contract and a lower-is-better
+metric unaided and found task-shaped ideas (ordinal decomposition and
+neighbour votes; log1p target and allometric features). One wine turn died on
+XGBoost's contiguous-label check when the smoke subsample lacked a class; the
+data profile now tells rivals to remap per fold, as the recipes do.
+
 ## 2026-09-02 — s6e9 live, advisor swarm
 
 **Rules accepted; campaign initialised.** 668,665 train / 286,571 test, 14
