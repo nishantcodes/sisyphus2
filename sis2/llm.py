@@ -124,6 +124,30 @@ class Throttled(RuntimeError):
     """The subscription is out of quota for now — fall back, do not retry."""
 
 
+class ModelExhausted(Throttled):
+    """ONE model is out of budget ("You've hit your monthly spend limit. Switch
+    to another model to continue."), not the whole subscription. Measured
+    2026-09-25: Fable 5.1 returned exactly this while Opus, Sonnet and Haiku
+    still answered — and because the CLI exits 1, the old code never parsed the
+    JSON, so rival_b failed every turn of campaign E with an opaque error."""
+
+    def __init__(self, model: str, msg: str):
+        super().__init__(f"{model}: {msg}")
+        self.model = model
+
+
+# When a model is exhausted, its seats are served by the next model here.
+MODEL_FALLBACK = {
+    "claude-fable-5-1": "claude-opus-5-5",
+    "claude-fable-5": "claude-opus-5-5",
+    "claude-opus-5-5": "claude-sonnet-5",
+    "claude-sonnet-5": "claude-haiku-4-5",
+}
+EXHAUSTED_FOR_S = float(os.getenv("SIS_EXHAUSTED_HOURS", "6")) * 3600
+_SPEND_LIMIT = ("spend limit", "switch to another model", "monthly limit",
+                "credit balance")
+
+
 # ------------------------------------------------------------------ backends
 
 # Variables that bind a `claude` process to the session that launched it. When
@@ -181,8 +205,10 @@ class CLIBackend:
             except OSError:
                 pass
 
-    def complete(self, system: str, user: str, seat: str) -> tuple[str, dict]:
-        model, effort = SEATS.get(seat, ("sonnet", "medium"))
+    def complete(self, system: str, user: str, seat: str,
+                 model: str = "") -> tuple[str, dict]:
+        override = bool(model)
+        model = model or SEATS.get(seat, ("sonnet", "medium"))[0]
         base = ["claude", "-p", user, "--output-format", "json", "--model", model,
                 "--append-system-prompt", system,
                 # This process only ever asks for text back. Denying tools stops
@@ -192,7 +218,10 @@ class CLIBackend:
         # whatever model created it — 24 debugger calls configured as `haiku`
         # were served by claude-sonnet-5 this way. The big seats keep the 5.7x
         # cache saving; the cheap ones keep their model.
-        sid = None if seat in ("debugger", "debugger_strong", "reporter") else self._sessions.get(seat)
+        # An override (fallback model) must not resume the seat's session:
+        # resume ignores --model and would keep serving the exhausted model.
+        sid = None if (override or seat in ("debugger", "debugger_strong", "reporter")) \
+            else self._sessions.get(seat)
         cmd = base + (["--resume", sid] if sid else [])
         env = _child_env()
         proc = subprocess.run(cmd, capture_output=True, text=True,
@@ -204,20 +233,27 @@ class CLIBackend:
             proc = subprocess.run(base, capture_output=True, text=True,
                                   timeout=CLI_TIMEOUT, env=env)
         raw = proc.stdout.strip()
-        if proc.returncode != 0 or not raw:
-            err = (proc.stderr or raw or "")[-500:]
-            if any(s in err.lower() for s in _THROTTLE):
-                raise Throttled(err)
-            raise RuntimeError(f"claude -p failed: {err}")
+        # Parse the JSON FIRST, whatever the exit code: an API error (429,
+        # spend limit) arrives as exit 1 WITH a JSON body that says why.
         try:
-            d = json.loads(raw)
+            d = json.loads(raw) if raw else None
         except json.JSONDecodeError:
-            raise RuntimeError(f"claude -p returned non-JSON: {raw[:300]}")
-        if d.get("is_error"):
-            msg = str(d.get("result") or d.get("api_error_status") or "")
-            if any(s in msg.lower() for s in _THROTTLE):
-                raise Throttled(msg)
-            raise RuntimeError(f"claude -p error: {msg[:400]}")
+            d = None
+        if d is not None and (d.get("is_error") or proc.returncode != 0):
+            msg = str(d.get("result") or "")
+            status = d.get("api_error_status")
+            if any(k in msg.lower() for k in _SPEND_LIMIT):
+                raise ModelExhausted(model, msg[:300])
+            if status == 429 or any(k in msg.lower() for k in _THROTTLE):
+                raise Throttled(msg or f"HTTP {status}")
+            raise RuntimeError(f"claude -p error ({status}): {msg[:400]}")
+        if d is None:
+            err = (proc.stderr or raw or "")[-500:]
+            if any(k in err.lower() for k in _SPEND_LIMIT):
+                raise ModelExhausted(model, err[:300])
+            if any(k in err.lower() for k in _THROTTLE):
+                raise Throttled(err)
+            raise RuntimeError(f"claude -p failed (exit {proc.returncode}): {err}")
         if d.get("session_id"):
             self._remember(seat, d["session_id"])
         u = d.get("usage", {}) or {}
@@ -251,9 +287,11 @@ class APIBackend:
         import anthropic
         self._client = anthropic.Anthropic()
 
-    def complete(self, system: str, user: str, seat: str) -> tuple[str, dict]:
+    def complete(self, system: str, user: str, seat: str,
+                 model: str = "") -> tuple[str, dict]:
         import anthropic
         alias, effort = SEATS.get(seat, ("sonnet", "medium"))
+        alias = model or alias
         model = API_MODEL.get(alias, alias)
         for attempt in range(4):
             # Fable-family models run thinking ALWAYS ON — sending a `thinking`
@@ -431,6 +469,11 @@ class LLM:
         self._api_broken = ""
         self._throttled_until = 0.0
         self._advisor_turn = 0
+        self._exhausted_path = Path(home) / ".exhausted.json"
+        try:
+            self._exhausted = json.loads(self._exhausted_path.read_text())
+        except Exception:
+            self._exhausted = {}
         # Optional and entirely absent unless configured — an unset compat
         # backend must behave exactly like one that was never written.
         try:
@@ -501,6 +544,22 @@ class LLM:
             else:
                 raise RuntimeError(f"{alias} unavailable after 3 tries: {last}")
 
+        # Serve the seat with the first model in its fallback chain that is not
+        # known to be out of budget.
+        want = alias
+        model = want
+        # A rival's fallback also skips models the OTHER rivals already use:
+        # Fable falling back to Opus beside an Opus rival_a would make the
+        # rivalry one model's priors twice.
+        taken = ({SEATS[r][0] for r in rivals() if r != seat}
+                 if seat.startswith("rival_") else set())
+        while model and (self._exhausted.get(model, 0) > time.time()
+                         or (model != want and model in taken)):
+            model = MODEL_FALLBACK.get(model, "")
+        if not model:
+            raise RuntimeError(f"every model in {want}'s fallback chain is exhausted")
+        override = model if model != want else ""
+
         order = [self._cli, self._api_backend()] if self.prefer == "cli" \
             else [self._api_backend(), self._cli]
         # A recent throttle means skip the CLI entirely rather than paying the
@@ -532,7 +591,28 @@ class LLM:
                 continue
             t0 = time.perf_counter()
             try:
-                text, usage = backend.complete(system, user, seat)
+                if override and backend.name in ("cli", "api"):
+                    text, usage = backend.complete(system, user, seat, model=override)
+                else:
+                    text, usage = backend.complete(system, user, seat)
+            except ModelExhausted as e:
+                # One model's budget, not the subscription's: remember it and
+                # re-serve this call from the next model in the chain. This
+                # must NOT set _throttled_until — that would push every seat
+                # onto the billed API (which has no key here) for ten minutes.
+                self._exhausted[e.model] = time.time() + EXHAUSTED_FOR_S
+                try:
+                    self._exhausted_path.write_text(json.dumps(self._exhausted))
+                except OSError:
+                    pass
+                nxt = MODEL_FALLBACK.get(e.model, "")
+                print(f"  [budget] {e.model} exhausted — {seat} falls back to "
+                      f"{nxt or 'nothing'} for {EXHAUSTED_FOR_S / 3600:.0f}h", flush=True)
+                if nxt:
+                    return self.complete(seat, system, user,
+                                         experiment_id=experiment_id)
+                last = e
+                continue
             except Throttled as e:
                 # Only the SUBSCRIPTION has a throttle window worth remembering.
                 # A third-party 429/503 says nothing about our Claude quota, and
@@ -695,7 +775,28 @@ def demo() -> None:
         llm._cli = FakeCLI()
         assert llm.complete("debugger", "sys", "hi") == "from-cli"
 
-    print("llm.py: 8 checks passed")
+        # A model out of budget re-serves the call from the next model in its
+        # chain, remembers that, and never trips the subscription throttle.
+        class FakeExhaustCLI:
+            name = "cli"
+            seen = []
+
+            def complete(self, s, u, seat, model=""):
+                FakeExhaustCLI.seen.append(model)
+                if not model:          # the seat's own model: out of budget
+                    raise ModelExhausted("claude-fable-5-1", "monthly spend limit")
+                return f"from-{model}", {"input": 1, "output": 1, "cache_read": 0,
+                                         "cache_write": 0, "usd": 0.0,
+                                         "billed": False, "model": model}
+        SEATS["_t"] = ("claude-fable-5-1", "high")
+        llm._cli, llm._throttled_until = FakeExhaustCLI(), 0.0
+        assert llm.complete("_t", "sys", "hi") == "from-claude-opus-5-5"
+        assert llm._throttled_until == 0.0
+        assert llm.complete("_t", "sys", "hi") == "from-claude-opus-5-5"
+        assert FakeExhaustCLI.seen == ["", "claude-opus-5-5", "claude-opus-5-5"]
+        del SEATS["_t"]
+
+    print("llm.py: 12 checks passed")
 
 
 if __name__ == "__main__":

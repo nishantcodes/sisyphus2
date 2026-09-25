@@ -95,6 +95,20 @@ patience 100; CatBoost lr 0.12, 2000 iters). At this size training, not model
 latency, is the bottleneck — pipelining matters more, and heavy runs belong on
 Kaggle GPU kernels once credentials exist.
 
+**Fable 5.1 ran out of budget — and the harness could not tell.** Campaign E
+(final default seats on bank) had rival_b fail all 6 of its turns. The CLI
+exits 1 with a JSON body — `api_error_status 429`, "You've hit your monthly
+spend limit. Switch to another model to continue." — but the backend only
+parsed JSON on exit 0, so the reason was lost and the call fell through to the
+billed API, which has no key here. Opus, Sonnet and Haiku still answered. Now:
+JSON is parsed whatever the exit code; a spend limit raises `ModelExhausted`
+for that MODEL (it no longer trips the subscription-wide throttle); the seat
+is re-served down `MODEL_FALLBACK` (Fable -> Opus -> Sonnet -> Haiku) for 6h,
+skipping any model another rival already holds so the rivalry stays two
+different priors (Fable's seat now lands on Sonnet). E therefore ran as Opus
+alone: 6 turns, private 0.95384, significantly below A (-0.00077, CI
+-0.00140..-0.00011) — one more point for two distinct rivals over one.
+
 ## 2026-09-02 — s6e9 live, advisor swarm
 
 **Rules accepted; campaign initialised.** 668,665 train / 286,571 test, 14
