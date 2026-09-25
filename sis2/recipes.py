@@ -66,6 +66,16 @@ def score(yy, pp):
     if "mae" in m: return -M.mean_absolute_error(yy, pp)
     if "rmse" in m or TASK == "reg": return -np.sqrt(np.mean((yy - pp) ** 2))
     return M.roc_auc_score(yy, pp)
+# Scale-aware boosting budget. Timed at s6e9 size (668k rows x 10 folds, 4
+# cores) with the small-table settings: LGBM 27 min, XGB 36 min, CatBoost past
+# a 60-min timeout (upper bounds — early stopping never fired on that data).
+# A large table needs fewer, bigger steps; the gain from lr 0.03 over 0.08 is
+# below the paired-test floor at that size anyway.
+BIG = len(tr) > 200_000
+LR = 0.08 if BIG else 0.03
+ROUNDS = 3000 if BIG else 5000
+PATIENCE = 100 if BIG else 200
+CB_LR, CB_ITERS = (0.12, 2000) if BIG else (0.08, 3000)
 if TASK == "multi":
     SIGN = 1 if ("map" in METRIC.lower() or "acc" in METRIC.lower()) else -1
 else:
@@ -122,21 +132,21 @@ _MODELS = {
     "lgbm": r'''
 import lightgbm as lgb
 def fit_predict(Xa, ya, Xv, yv, outs):
-    params = dict(n_estimators=5000, learning_rate=0.03, num_leaves=63,
+    params = dict(n_estimators=ROUNDS, learning_rate=LR, num_leaves=63,
                   min_child_samples=40, subsample=0.8, subsample_freq=1,
                   colsample_bytree=0.7, reg_lambda=1.0, max_bin=255,
                   random_state=SEED, n_jobs=THREADS, verbose=-1)
     m = (lgb.LGBMRegressor if TASK == "reg" else lgb.LGBMClassifier)(**params)
-    m.fit(Xa, ya, eval_set=[(Xv, yv)], callbacks=[lgb.early_stopping(200, verbose=False)])
+    m.fit(Xa, ya, eval_set=[(Xv, yv)], callbacks=[lgb.early_stopping(PATIENCE, verbose=False)])
     return [proba(m, Z) for Z in outs]
 ''',
     "xgb": r'''
 import xgboost as xgb
 def fit_predict(Xa, ya, Xv, yv, outs):
-    params = dict(n_estimators=5000, learning_rate=0.03, max_depth=7,
+    params = dict(n_estimators=ROUNDS, learning_rate=LR, max_depth=7,
                   min_child_weight=5, subsample=0.8, colsample_bytree=0.7,
                   reg_lambda=1.0, tree_method="hist", enable_categorical=True,
-                  max_cat_to_onehot=1, early_stopping_rounds=200,
+                  max_cat_to_onehot=1, early_stopping_rounds=PATIENCE,
                   random_state=SEED, n_jobs=THREADS)
     m = (xgb.XGBRegressor if TASK == "reg" else xgb.XGBClassifier)(**params)
     m.fit(Xa, ya, eval_set=[(Xv, yv)], verbose=False)
@@ -149,9 +159,9 @@ def fit_predict(Xa, ya, Xv, yv, outs):
         Z = Z.copy()
         for c in cats: Z[c] = Z[c].astype(str)
         return Z
-    params = dict(iterations=3000, learning_rate=0.08, depth=6,
+    params = dict(iterations=CB_ITERS, learning_rate=CB_LR, depth=6,
                   l2_leaf_reg=3, random_seed=SEED, thread_count=THREADS,
-                  od_type="Iter", od_wait=200, verbose=False)
+                  od_type="Iter", od_wait=PATIENCE, verbose=False)
     if TASK == "multi" and len(np.unique(ya)) > 2: params["loss_function"] = "MultiClass"
     m = (CatBoostRegressor if TASK == "reg" else CatBoostClassifier)(**params)
     m.fit(Pool(prep(Xa), ya, cat_features=cats), eval_set=Pool(prep(Xv), yv, cat_features=cats),

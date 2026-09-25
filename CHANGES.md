@@ -87,6 +87,14 @@ neighbour votes; log1p target and allometric features). One wine turn died on
 XGBoost's contiguous-label check when the smoke subsample lacked a class; the
 data profile now tells rivals to remap per fold, as the recipes do.
 
+**Scale check for s6e9 on this container** (668k x 10 folds, 4 cores,
+synthetic resample — its duplicates leak across folds, so early stopping never
+fired and these are upper bounds): LGBM 27 min, XGB 36 min, CatBoost > 60 min
+(timeout). Recipes are now scale-aware (> 200k rows: lr 0.08, 3000 rounds,
+patience 100; CatBoost lr 0.12, 2000 iters). At this size training, not model
+latency, is the bottleneck — pipelining matters more, and heavy runs belong on
+Kaggle GPU kernels once credentials exist.
+
 ## 2026-09-02 — s6e9 live, advisor swarm
 
 **Rules accepted; campaign initialised.** 668,665 train / 286,571 test, 14
