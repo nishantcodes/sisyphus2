@@ -922,7 +922,12 @@ variant that ties, because it adds information the ledger does not have.
         against THAT family's own champion, so the verdict still means "this
         change helps this model".
         """
-        if os.getenv("SIS_PORT", "1") == "0":
+        # Opt-in. Measured on the bank proxy (campaign D): ports won 5 of 7
+        # verdicts against weak family champions, but a port is a near-copy of
+        # its source model, so the blend gained nothing (D's blend 0.95178 vs
+        # 0.95219 without the porter) and D's private score was the only one
+        # significantly below another arm's (bootstrap CI vs A: +0.0002..+0.0017).
+        if os.getenv("SIS_PORT", "0") != "1":
             return []
         exp = self.conn.execute("SELECT * FROM experiments WHERE id=?",
                                 (exp_id,)).fetchone()

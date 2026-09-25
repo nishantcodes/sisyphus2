@@ -108,6 +108,14 @@ def cmd_run(a) -> None:
     camp = _campaign(a.slug)
     seats = llm_mod.rivals()   # rival_c joins automatically when configured
     started = time.time()
+    if a.total:
+        # Resumable: run only the turns still missing from the ledger, so the
+        # same command can be relaunched after a container restart.
+        done = camp.conn.execute(
+            "SELECT COUNT(*) FROM experiments WHERE source IN ('agent','user') "
+            "AND status IN ('done','failed')").fetchone()[0]
+        a.turns = max(0, a.total - done)
+        print(f"[resume] {done} agent turns in the ledger; running {a.turns} more")
     if notify.enabled() and not a.quiet:
         notify.send(f"sis2 campaign starting on {a.slug} — {a.turns} turns")
 
@@ -497,7 +505,9 @@ def cmd_compare(a) -> None:
         hib = store.higher_is_better(conn)
         agg = "MAX" if hib else "MIN"
         q = lambda sql: conn.execute(sql).fetchone()[0]
-        agent_rows = "source NOT IN ('recipe','operator')"
+        # Ports and bags are mechanical: counting their verdicts as agent
+        # wins made the porter arm look 3x better than it was.
+        agent_rows = "source NOT IN ('recipe','operator','port','bag')"
         n = q(f"SELECT COUNT(*) FROM experiments WHERE {agent_rows} "
               f"AND status IN ('done','failed')")
         fails = q(f"SELECT COUNT(*) FROM experiments WHERE {agent_rows} AND status='failed'")
@@ -607,6 +617,9 @@ def main() -> None:
     r = sub.add_parser("run", help="run the improvement loop")
     r.add_argument("slug")
     r.add_argument("--turns", type=int, default=20)
+    r.add_argument("--total", type=int, default=0,
+                   help="run until the ledger holds this many agent turns "
+                        "(overrides --turns; safe to relaunch after a restart)")
     r.add_argument("--hours", type=float, default=0, help="wall-clock budget")
     r.add_argument("--no-submit", dest="submit", action="store_false")
     # Blending is NOT part of a campaign. Rivals build individual models;

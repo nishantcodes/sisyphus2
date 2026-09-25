@@ -63,8 +63,15 @@ Read with care — one campaign per arm, private differences of ~0.0005:
 * Two of B's three wins were a rival hand-porting one feature set to other
   families — the porter now does that.
 
-Next: D = hybrid (Opus writes its own code; Fable thinks, Sonnet implements;
-porter on), `SIS_SPLIT=rival_b`.
+Then D = hybrid (Opus codes; Fable thinks, Sonnet implements; porter on) —
+killed by a container restart after 8 agent turns: 3 agent wins (5 more from
+ports/bags), blend 0.95178, private 0.95367. A paired bootstrap on the private
+rows found only one significant gap between arms: A over D (+0.00094, CI
++0.00024..+0.00165); all others straddle zero. So: A (competitors, each
+writes code) is the default; the porter is now opt-in (`SIS_PORT=1`) because
+its "wins" added no blend diversity; `compare` no longer counts ports/bags as
+wins; `sis2 run --total N` resumes to N agent turns after a restart. Final
+table and recommendation: ARCHITECTURE.md §4.
 
 ## 2026-09-02 — s6e9 live, advisor swarm
 

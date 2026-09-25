@@ -51,7 +51,8 @@ a verdict row, a discovery note, a hint.
 |---|---|---|---|
 | `rival_a` | propose one change + write the code | Opus 5.5 | judgement is the product |
 | `rival_b` | same, alternating turns | Fable 5.1 | a *different* prior; two copies of one model is one expensive agent |
-| `executor` | write code from a spec (only with `SIS_SPLIT=1`) | Sonnet 5 | see §4 |
+| `executor` | write code from a spec (only with `SIS_SPLIT`) | Sonnet 5 | see §4 |
+| `porter` | carry a win onto other GBDT families (opt-in `SIS_PORT=1`) | Sonnet 5 | see §4 |
 | `debugger` | repair a failing script (≤3x per experiment) | Haiku 4.5 | reads a traceback; runs most turns |
 | `reporter` | write the discovery note | Haiku 4.5 | low stakes, high volume |
 | `researcher` | distil public notebooks into notes | Sonnet 5 | reading comprehension |
@@ -79,19 +80,38 @@ loop:
 
 ## 4. Competitors, or a thinker and an implementer? — measured
 
-The question: do two frontier models each writing their own code (A) beat the
-same two models deciding while a mid-tier model implements their spec (B)?
+Four arms, identical data (local bank proxy: same split, folds and recipe
+seed), ~12 agent turns each, 2 threads each. "wins" excludes mechanical ports
+and bags.
 
-Both ran 12 turns in parallel on identical data (local bank proxy, same split
-and folds, same recipe seed, 2 threads each). Results are recorded in
-`work/bankA.log` / `work/bankB.log`; the table is filled from those logs:
+| arm | turns | wins | fail | best single | blend | private (best-public pick) | notional $ |
+|---|---|---|---|---|---|---|---|
+| **A** Opus + Fable, each writes its own code | 12 | 1 | 3 | 0.95163 | **0.95219** | **0.95462** | 33.65 |
+| **B** Opus + Fable decide, Sonnet implements | 12 | 3 | 1 | **0.95187** | **0.95219** | 0.95417 | 23.14 |
+| **C** Opus + Sonnet, each writes its own code | 12 | 1 | 1 | 0.95028 | 0.95100 | 0.95413 | **8.53** |
+| **D** hybrid: Opus codes; Fable decides, Sonnet implements; porter on | 8 | 3 | 0 | 0.95120 | 0.95178 | 0.95367 | 36.32 |
 
-| | A: competitors | B: think + implement |
-|---|---|---|
-| see CHANGES.md 2026-09-24 | | |
+Paired bootstrap on the 9,877 private rows (500 resamples): the ONLY
+significant gap is A over D (+0.00094, 95% CI +0.00024 to +0.00165). A-B,
+A-C, B-C, B-D and C-D all straddle zero. Every arm beat the no-agent LGBM
+baseline (private 0.95291).
 
-(The measured table and verdict live in CHANGES.md, next to the date they were
-taken, so this file does not go stale when the numbers are re-measured.)
+What that supports:
+
+1. **Competitors, two different frontier models, each writing its own code**
+   (A) is the default. It never lost and holds the only significant win. Its
+   edge came from Fable's neural nets — weaker alone (0.946-0.951) but
+   decorrelated, so the portfolio used them. The cost is wall clock on CPU (one
+   transformer ran 55 min); on Kaggle GPU kernels that cost mostly disappears.
+2. **Thinker + implementer** (B) converts ideas to single-model wins fastest
+   and halves the expensive model's cost per call; it tied A on blend CV. Use
+   it (`SIS_SPLIT=rival_b`) when the budget is tokens rather than wall clock.
+3. **A mid-tier model as a rival** (C) is cheap and weak on ideas.
+4. **Automatic porting** (D) inflates the win count without adding portfolio
+   diversity, so it is off by default (`SIS_PORT=1` to enable).
+
+Caveat stated plainly: one campaign per arm on one small dataset. A second
+proxy (UCI adult) replication is the next measurement.
 
 ## 5. Judging and submitting
 
