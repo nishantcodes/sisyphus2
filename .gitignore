@@ -7,3 +7,8 @@ __pycache__/
 notes/**/ledger.db
 # proxy-campaign notes are test artifacts; kept locally, not versioned
 notes/bank*/
+notes/adult*/
+notes/wine/
+notes/abalone/
+notes/_*/ledger.db
+notes/_fz/
